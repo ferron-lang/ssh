@@ -1,0 +1,265 @@
+// `probe`: the `ssh` package from the command line, for `scripts/interop`.
+//
+//   probe serve port=2301 host_key=FILE
+//   probe connect port=2300 user=NAME policy=strict known_hosts=FILE key=FILE
+//   probe run ... command=TEXT timeout_ms=5000 max_output=65536
+//   probe shell ... expect=TEXT send=TEXT resize=100x30 end=
+//
+// `serve` is an echo server: it greets, sends back what the client types,
+// reports window changes, and ends the session at `q`. The other actions
+// connect with `ssh.client` (`policy` is `strict`, `accept-new`, or
+// `pin` with `pin=SHA256:...`; `key=`, `passphrase=`, `agent=`, and
+// `password=` add authentication methods in the order given) and print
+// one line per result; a failure prints `error <Kind>: <message>` and
+// exits with status 1. `shell` runs its steps in order: `send` types
+// text, `expect` waits for the output to hold a text, `resize` changes
+// the window, `end` waits for the shell to end.
+
+use std.bytes.Bytes
+use std.env.Env
+use std.fs.Path
+use std.io.Console
+use std.process.ExitCode
+use std.time.{Clock, Duration}
+use ssh.client.{
+  AcceptNew,
+  Agent,
+  Auth,
+  ClientConfig,
+  Ended,
+  Fingerprint,
+  HostKeyPolicy,
+  KeyFile,
+  Password,
+  Pty,
+  Secret,
+  Shell,
+  Stderr,
+  Stdout,
+  Strict,
+  connect
+}
+use ssh.error.{Config, SshError}
+use ssh.server.serve
+use ssh.session.{Input, Session}
+
+struct Arg {
+  name: String,
+  value: String,
+}
+
+fn parse(values: List[String]) -> List[Arg] {
+  var args: List[Arg] = []
+  for value in values {
+    match value.split_once("=") {
+      Some((name, rest)) => args.push(Arg { name: name, value: rest })
+      None => args.push(Arg { name: value, value: "" })
+    }
+  }
+  return args
+}
+
+fn find(args: List[Arg], name: String, fallback: String) -> String {
+  for arg in args {
+    if arg.name == name {
+      return arg.value
+    }
+  }
+  return fallback
+}
+
+fn number(args: List[Arg], name: String, fallback: Int) -> Int {
+  return Int.parse(find(args, name, "{fallback}")).unwrap_or(fallback)
+}
+
+fn client_config(args: List[Arg]) -> Result[ClientConfig, SshError] {
+  let known_hosts = Path.from(find(args, "known_hosts", "known_hosts"))
+  var policy: HostKeyPolicy = Strict(known_hosts)
+  match find(args, "policy", "strict") {
+    "strict" => {
+    }
+    "accept-new" => policy = AcceptNew(known_hosts)
+    "pin" => policy = Fingerprint(find(args, "pin", ""))
+    other => return Err(SshError { kind: Config, message: "unknown policy {other}" })
+  }
+  var passphrase: Option[Secret] = None
+  var auth: List[Auth] = []
+  for arg in args {
+    match arg.name {
+      "passphrase" => passphrase = Some(Secret.new(arg.value))
+      "key" => auth.push(KeyFile(Path.from(arg.value), passphrase))
+      "agent" => auth.push(Agent)
+      "password" => auth.push(Password(Secret.new(arg.value)))
+      _ => {
+      }
+    }
+  }
+  return Ok(
+    ClientConfig {
+      host: find(args, "host", "127.0.0.1"),
+      port: number(args, "port", 22),
+      user: find(args, "user", "probe"),
+      timeout: Duration.milliseconds(number(args, "connect_timeout_ms", 5000)),
+      host_key: policy,
+      auth: auth,
+    }
+  )
+}
+
+// Text as one printable line: what is not ASCII text becomes `.`.
+fn shown(bytes: Bytes) -> String {
+  var text = ""
+  for byte in bytes.to_list() {
+    if byte == 10u8 {
+      text = text + "\\n"
+    } else if byte >= 32u8 && byte < 127u8 {
+      text = text + String.from_code_point(u32.from(byte)).unwrap_or(".")
+    } else {
+      text = text + "."
+    }
+  }
+  return text
+}
+
+fn run_steps(console: Console, clock: Clock, args: List[Arg], shell: mut Shell) -> Result[Bool, SshError] {
+  var seen = Bytes.empty()
+  var ok = true
+  for arg in args {
+    match arg.name {
+      "send" => shell.write(arg.value.utf8_bytes())?
+      "resize" => {
+        match arg.value.split_once("x") {
+          Some((columns, rows)) => shell.resize(Int.parse(columns).unwrap_or(0), Int.parse(rows).unwrap_or(0))?
+          None => {
+          }
+        }
+      }
+      "expect" => {
+        let wanted = arg.value.utf8_bytes()
+        let started = clock.now()
+        var open = true
+        while open && seen.find(wanted).is_none() && clock.since(started) < Duration.seconds(10) {
+          for event in shell.poll(Duration.milliseconds(200)) {
+            match event {
+              Stdout(bytes) => seen = Bytes.concat([seen, bytes])
+              Stderr(bytes) => seen = Bytes.concat([seen, bytes])
+              Ended(_) => open = false
+            }
+          }
+        }
+        match seen.find(wanted) {
+          Some(at) => {
+            console.print("ok expect {arg.value}")
+            seen = seen[at + wanted.len()..]
+          }
+          None => {
+            console.print("FAIL expect {arg.value}: got {shown(seen)}")
+            ok = false
+          }
+        }
+      }
+      "end" => {
+        let started = clock.now()
+        var ended = false
+        while !ended && clock.since(started) < Duration.seconds(10) {
+          for event in shell.poll(Duration.milliseconds(200)) {
+            match event {
+              Ended(status) => {
+                console.print("ended {status}")
+                ended = true
+              }
+              _ => {
+              }
+            }
+          }
+        }
+        if !ended {
+          console.print("FAIL end: the shell is still open")
+          ok = false
+        }
+      }
+      _ => {
+      }
+    }
+  }
+  return Ok(ok)
+}
+
+fn act(env: Env, action: String, args: List[Arg]) -> Result[Bool, SshError] {
+  if action == "serve" {
+    let config = ssh.server.Config {
+      address: find(args, "address", "127.0.0.1"),
+      port: number(args, "port", 2301),
+      host_key: Path.from(find(args, "host_key", "host_key")),
+      max_connections: 8,
+      allow_guests: false,
+      login_timeout: Duration.seconds(10),
+    }
+    serve(env.actors, env.clock, env.fs, config, echo)?
+    return Ok(true)
+  }
+  let client = connect(env.net, env.fs, env.clock, client_config(args)?)?
+  env.console.print("connected {client.host_key()}")
+  if action == "run" {
+    let timeout = Duration.milliseconds(number(args, "timeout_ms", 5000))
+    let output = client.run(find(args, "command", "true"), timeout, number(args, "max_output", 65536))?
+    env.console.print("status {output.status}")
+    env.console.print("stdout {shown(output.stdout)}")
+    env.console.print("stderr {shown(output.stderr)}")
+  }
+  if action == "shell" {
+    let pty = Pty {
+      term: find(args, "term", "xterm"),
+      columns: number(args, "columns", 80),
+      rows: number(args, "rows", 24)
+    }
+    let console = env.console
+    let clock = env.clock
+    return client.shell(
+      pty,
+      fn(shell: mut Shell) -> Result[Bool, SshError] {
+        return run_steps(console, clock, args, mut shell)
+      }
+    )
+  }
+  return Ok(true)
+}
+
+// The echo handler of `serve`.
+fn echo(session: mut Session) -> Unit {
+  let (columns, rows) = session.size()
+  let _ = session.write("hello {session.user()} {session.identity()} {session.term()} {columns}x{rows}\r\n".utf8_bytes())
+  var open = true
+  while open {
+    for input in session.poll(Duration.milliseconds(500)) {
+      match input {
+        Input.Data(bytes) => {
+          let _ = session.write(bytes)
+          if bytes.find("q".utf8_bytes()).is_some() {
+            open = false
+          }
+        }
+        Input.Resize(width, height) => {
+          let _ = session.write("resize {width}x{height}\r\n".utf8_bytes())
+        }
+        Input.Closed => open = false
+      }
+    }
+  }
+}
+
+fn main(env: Env) -> ExitCode {
+  let values = env.args.values()
+  if values.is_empty() {
+    env.console.error("usage: probe serve|connect|run|shell name=value ...")
+    return ExitCode.failure(2)
+  }
+  match act(env, values[0], parse(values[1..])) {
+    Ok(true) => return ExitCode.success()
+    Ok(false) => return ExitCode.failure(1)
+    Err(error) => {
+      env.console.print("error {error}")
+      return ExitCode.failure(1)
+    }
+  }
+}
