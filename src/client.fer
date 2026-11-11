@@ -1,0 +1,1077 @@
+// `ssh.client`: `connect`, an SSH connection to a server: it checks the
+// server's host key, authenticates, and then runs commands (`Client.run`)
+// or drives an interactive shell on a terminal (`Client.shell`).
+//
+// The server's host key is always checked: against a `known_hosts` file
+// or against one pinned fingerprint. There is no policy that accepts any
+// key.
+//
+// libssh's calls block their thread, and it keeps a session to one
+// thread. Call `connect` from `main`, or from an actor spawned with
+// `scope.spawn_pinned`, which has a thread of its own; a `Client` is not
+// sendable and stays where it was made. Every wait is bounded: by
+// `ClientConfig.timeout`, or by the timeout the call takes. Timeouts are
+// measured on the `Clock` given to `connect` and, so that a clock that
+// stands still (a test's) cannot make a wait endless, also by the time
+// libssh was asked to wait.
+
+use std.bytes.Bytes
+use std.encoding.base64
+use std.ffi.{CBuffer, CLong, CStr, Out, Ptr}
+use std.fs.{Fs, Path}
+use std.net.Net
+use std.test.TestContext
+use std.time.{Clock, Duration}
+use pkg.common.{
+  SSH_AUTH_DENIED,
+  SSH_AUTH_METHOD_INTERACTIVE,
+  SSH_AUTH_METHOD_PASSWORD,
+  SSH_AUTH_METHOD_PUBLICKEY,
+  SSH_AUTH_PARTIAL,
+  SSH_AUTH_SUCCESS,
+  SSH_OK,
+  fingerprint,
+  session_error
+}
+use pkg.error.{
+  Authentication,
+  Channel,
+  Config,
+  Connect,
+  HostKeyChanged,
+  HostKeyUnknown,
+  KnownHosts,
+  SshError,
+  SshErrorKind,
+  Timeout,
+  TooLarge,
+  failure
+}
+use pkg.sys.hand.ssh_pki_import_privkey_file
+use pkg.sys.libssh.{
+  ssh_channel,
+  ssh_channel_change_pty_size,
+  ssh_channel_close,
+  ssh_channel_free,
+  ssh_channel_get_exit_state,
+  ssh_channel_is_closed,
+  ssh_channel_is_eof,
+  ssh_channel_is_open,
+  ssh_channel_new,
+  ssh_channel_open_session,
+  ssh_channel_poll,
+  ssh_channel_poll_timeout,
+  ssh_channel_read_nonblocking,
+  ssh_channel_request_exec,
+  ssh_channel_request_pty_size,
+  ssh_channel_request_shell,
+  ssh_channel_send_eof,
+  ssh_channel_write,
+  ssh_connect,
+  ssh_disconnect,
+  ssh_free,
+  ssh_get_server_publickey,
+  ssh_init,
+  ssh_is_connected,
+  ssh_key,
+  ssh_key_free,
+  ssh_known_hosts_e,
+  ssh_new,
+  ssh_options_e,
+  ssh_options_set,
+  ssh_session,
+  ssh_session_is_known_server,
+  ssh_session_update_known_hosts,
+  ssh_string_free_char,
+  ssh_userauth_agent,
+  ssh_userauth_list,
+  ssh_userauth_none,
+  ssh_userauth_password,
+  ssh_userauth_publickey
+}
+
+// Bytes asked of libssh in one read.
+const CHUNK: Int = 32768
+// The most bytes one `Shell.poll` returns; the rest waits in the channel's
+// window, which holds the server back.
+const MAX_POLL: Int = 1048576
+// How long one wait for the server's output lasts before the other stream
+// is looked at.
+const WAIT_SLICE: Int = 25
+const MAX_TIMEOUT: Duration = Duration.hours(24)
+const MAX_TEXT: Int = 4096
+const MAX_WINDOW: Int = 1000
+const PIN_PREFIX: String = "SHA256:"
+
+/// A password or a passphrase. It displays as `<secret>`, so a config that
+/// is printed or logged does not show it.
+#[derive(Eq)]
+pub struct Secret {
+  text: String,
+}
+
+impl Secret {
+  pub fn new(text: String) -> Secret {
+    return Secret { text: text }
+  }
+}
+
+impl Display for Secret {
+  fn to_string(self) -> String {
+    return "<secret>"
+  }
+}
+
+/// How the server's host key is checked. Every policy fails with
+/// `HostKeyChanged` when the key is not the one expected.
+#[derive(Eq)]
+pub type HostKeyPolicy =
+  /// The key must already be in this `known_hosts` file (OpenSSH's
+  /// format); an unknown server fails with `HostKeyUnknown`.
+  | Strict(known_hosts: Path)
+  /// An unknown server's key is added to this `known_hosts` file, which is
+  /// created when missing; from then on the server must keep that key.
+  | AcceptNew(known_hosts: Path)
+  /// The key must have this fingerprint, in OpenSSH's form
+  /// `SHA256:<base64>` (what `ssh-keygen -l` prints); no file is read.
+  | Fingerprint(sha256: String)
+
+/// One way to authenticate.
+#[derive(Eq)]
+pub type Auth =
+  /// A private key file in OpenSSH or PEM format, with the passphrase
+  /// that decrypts it when it has one.
+  | KeyFile(path: Path, passphrase: Option[Secret])
+  /// The keys of the SSH agent named by the `SSH_AUTH_SOCK` environment
+  /// variable.
+  | Agent
+  | Password(password: Secret)
+
+/// Where `connect` connects and how.
+pub struct ClientConfig {
+  /// A host name or an IP address.
+  pub host: String,
+  pub port: Int,
+  pub user: String,
+  /// The longest wait for the connection, and then for each answer of the
+  /// server.
+  pub timeout: Duration,
+  pub host_key: HostKeyPolicy,
+  /// The methods to try, in order, until one lets the client in.
+  pub auth: List[Auth],
+}
+
+/// The terminal a shell runs on.
+#[derive(Eq)]
+pub struct Pty {
+  /// The terminal type, such as `xterm-256color`.
+  pub term: String,
+  pub columns: Int,
+  pub rows: Int,
+}
+
+/// How a command or a shell ended.
+#[derive(Eq, Hash)]
+pub type ExitStatus =
+  /// It exited with this status.
+  | Code(code: Int)
+  /// A signal killed it: `TERM`, `KILL`, ...
+  | Signal(name: String)
+  /// The server closed the channel, or the connection dropped, without
+  /// saying.
+  | Unknown
+
+/// What a command wrote and how it ended.
+#[derive(Eq)]
+pub struct CommandOutput {
+  pub stdout: Bytes,
+  pub stderr: Bytes,
+  pub status: ExitStatus,
+}
+
+/// What a shell sent since the last `Shell.poll`.
+#[derive(Eq)]
+pub type Event =
+  /// Bytes for the terminal. With a terminal the server sends everything
+  /// here.
+  | Stdout(bytes: Bytes)
+  | Stderr(bytes: Bytes)
+  /// The shell ended. It is the last event, and every later `poll`
+  /// returns it again.
+  | Ended(status: ExitStatus)
+
+/// An authenticated connection to a server. It disconnects when it closes.
+#[foreign_resource(close = close_client)]
+pub struct Client {
+  session: ssh_session,
+  clock: Clock,
+  host_key: String,
+}
+
+/// A channel of a `Client`: the shell `Client.shell` lends to its body.
+#[foreign_resource(close = close_shell)]
+pub struct Shell {
+  session: ssh_session,
+  channel: ssh_channel,
+  clock: Clock,
+  ended: Bool,
+  status: ExitStatus,
+}
+
+fn close_client(client: Client) -> Unit {
+  ssh_disconnect(client.session)
+  ssh_free(client.session)
+}
+
+fn close_shell(shell: Shell) -> Unit {
+  if ssh_channel_is_open(shell.channel) != 0i32 {
+    ssh_channel_send_eof(shell.channel)
+    ssh_channel_close(shell.channel)
+  }
+  ssh_channel_free(shell.channel)
+}
+
+/// Connects as `config` says: reaches the server, checks its host key,
+/// and authenticates. It blocks its thread for at most `config.timeout`
+/// per step.
+pub fn connect(_net: Net, fs: Fs, clock: Clock, config: ClientConfig) -> Result[Client, SshError] {
+  validate(config)?
+  for method in config.auth {
+    match method {
+      KeyFile(path, _) => {
+        if !fs.is_file(path) {
+          return Err(failure(Config, "the key file {path} does not exist"))
+        }
+      }
+      _ => {
+      }
+    }
+  }
+  if ssh_init() != SSH_OK {
+    return Err(failure(Connect, "libssh failed to initialize"))
+  }
+  var client = Client { session: ssh_new(), clock: clock, host_key: "" }
+  if client.session.is_null() {
+    return Err(failure(Connect, "out of memory"))
+  }
+  configure(client.session, config)?
+  let started = clock.now()
+  if ssh_connect(client.session) != SSH_OK {
+    let reason = session_error(client.session)
+    var kind = Connect
+    if timed_out(clock.since(started), config.timeout, reason) {
+      kind = Timeout
+    }
+    return Err(failure(kind, "{config.host} port {config.port}: {reason}"))
+  }
+  client.host_key = verify_host_key(client.session, config)?
+  authenticate(client.session, clock, config)?
+  return Ok(move client)
+}
+
+impl Client {
+  /// The fingerprint of the server's host key, `SHA256:<base64>`, as
+  /// checked by the policy.
+  pub fn host_key(self) -> String {
+    return self.host_key
+  }
+
+  /// Runs `command` in the user's shell on the server, with nothing on its
+  /// standard input, and waits for it to end. It fails with `Timeout`
+  /// when the command runs longer than `timeout`, and with `TooLarge`
+  /// when it writes more than `max_output` bytes to standard output and
+  /// standard error together; the channel is then closed, and whether the
+  /// command goes on running is up to the server.
+  pub fn run(self, command: String, timeout: Duration, max_output: Int) -> Result[CommandOutput, SshError] {
+    if command.is_empty() || !is_plain(command) {
+      return Err(failure(Config, "the command is empty or holds a NUL"))
+    }
+    if timeout <= Duration.milliseconds(0) || timeout > MAX_TIMEOUT {
+      return Err(failure(Config, "the timeout must be positive and at most 24 hours"))
+    }
+    if max_output < 0 {
+      return Err(failure(Config, "max_output is negative"))
+    }
+    var shell = self.open()?
+    if ssh_channel_request_exec(shell.channel, command) != SSH_OK {
+      return Err(self.refused("the command"))
+    }
+    let started = self.clock.now()
+    var stdout: List[Bytes] = []
+    var stderr: List[Bytes] = []
+    var total = 0
+    // Milliseconds spent in waits that brought nothing.
+    var idle = 0
+    var result: Option[ExitStatus] = None
+    while result.is_none() {
+      let left = timeout.as_milliseconds() - self.clock.since(started).as_milliseconds().max(idle)
+      if left <= 0 {
+        return Err(failure(Timeout, "the command did not end in {timeout}"))
+      }
+      let events = shell.read(Duration.milliseconds(left.min(WAIT_SLICE)), (max_output - total + 1).min(MAX_POLL))
+      if events.is_empty() {
+        idle += left.min(WAIT_SLICE)
+      }
+      for event in events {
+        match event {
+          Stdout(bytes) => {
+            total += bytes.len()
+            stdout.push(bytes)
+          }
+          Stderr(bytes) => {
+            total += bytes.len()
+            stderr.push(bytes)
+          }
+          Ended(status) => result = Some(status)
+        }
+      }
+      if total > max_output {
+        return Err(failure(TooLarge, "the command wrote more than {max_output} bytes"))
+      }
+    }
+    return Ok(
+      CommandOutput {
+        stdout: Bytes.concat(stdout),
+        stderr: Bytes.concat(stderr),
+        status: result.unwrap_or(Unknown)
+      }
+    )
+  }
+
+  /// Starts the user's shell on a terminal as `pty` describes and calls
+  /// `body` with it; the shell's channel closes when `body` returns, and
+  /// its result is returned.
+  pub fn shell[T](self, pty: Pty, body: impl Callable[(mut Shell), Result[T, SshError]]) -> Result[T, SshError] {
+    if pty.term.is_empty() || pty.term.len() > 64 || !is_plain(pty.term) {
+      return Err(failure(Config, "the terminal type is empty, longer than 64, or holds a NUL"))
+    }
+    let columns = window(pty.columns)?
+    let rows = window(pty.rows)?
+    var shell = self.open()?
+    if ssh_channel_request_pty_size(shell.channel, pty.term, columns, rows) != SSH_OK {
+      return Err(self.refused("a terminal"))
+    }
+    if ssh_channel_request_shell(shell.channel) != SSH_OK {
+      return Err(self.refused("a shell"))
+    }
+    return body(mut shell)
+  }
+
+  // A new `session` channel.
+  fn open(self) -> Result[Shell, SshError] {
+    if ssh_is_connected(self.session) == 0i32 {
+      return Err(failure(SshErrorKind.Closed, "the connection is closed"))
+    }
+    let shell = Shell {
+      session: self.session,
+      channel: ssh_channel_new(self.session),
+      clock: self.clock,
+      ended: false,
+      status: Unknown
+    }
+    if shell.channel.is_null() {
+      return Err(failure(Channel, "out of memory"))
+    }
+    if ssh_channel_open_session(shell.channel) != SSH_OK {
+      return Err(self.refused("a channel"))
+    }
+    return Ok(move shell)
+  }
+
+  fn refused(self, what: String) -> SshError {
+    if ssh_is_connected(self.session) == 0i32 {
+      return failure(SshErrorKind.Closed, "the connection closed while asking for {what}")
+    }
+    return failure(Channel, "the server refused {what}: {session_error(self.session)}")
+  }
+}
+
+impl Shell {
+  /// Waits at most `timeout` for the server and returns what it sent,
+  /// oldest first; an empty list when nothing came.
+  pub fn poll(mut self, timeout: Duration) -> List[Event] {
+    return self.read(timeout, MAX_POLL)
+  }
+
+  /// Sends `bytes` as typed input. It fails once the shell has ended.
+  pub fn write(mut self, bytes: Bytes) -> Result[Unit, SshError] {
+    if bytes.is_empty() {
+      return Ok(Unit)
+    }
+    if self.ended || ssh_channel_is_open(self.channel) == 0i32 {
+      return Err(failure(SshErrorKind.Closed, "the shell has ended"))
+    }
+    var buffer = CBuffer.from(bytes.to_list())
+    let length = bytes.len().try_to_u32().expect_ok("a write is smaller than 4 GiB")
+    if ssh_channel_write(self.channel, buffer.ptr().cast[Unit](), length) < 0i32 {
+      return Err(failure(SshErrorKind.Closed, "the shell has ended"))
+    }
+    return Ok(Unit)
+  }
+
+  /// Tells the server the terminal is now `columns` by `rows` cells.
+  pub fn resize(mut self, columns: Int, rows: Int) -> Result[Unit, SshError] {
+    let width = window(columns)?
+    let height = window(rows)?
+    if self.ended || ssh_channel_change_pty_size(self.channel, width, height) != SSH_OK {
+      return Err(failure(SshErrorKind.Closed, "the shell has ended"))
+    }
+    return Ok(Unit)
+  }
+
+  // `poll` returning at most about `limit` bytes.
+  fn read(mut self, timeout: Duration, limit: Int) -> List[Event] {
+    if self.ended {
+      return [Ended(self.status)]
+    }
+    self.wait(timeout)
+    var events: List[Event] = []
+    let out = drain(self.channel, 0i32, limit)
+    if !out.is_empty() {
+      events.push(Stdout(out))
+    }
+    let err = drain(self.channel, 1i32, limit - out.len())
+    if !err.is_empty() {
+      events.push(Stderr(err))
+    }
+    if events.is_empty() && self.finished() {
+      self.ended = true
+      self.status = exit_state(self.channel)
+      events.push(Ended(self.status))
+    }
+    return events
+  }
+
+  // Returns once either stream has something, the channel ended, or
+  // `timeout` passed. libssh waits on one stream at a time, so the wait
+  // is cut into slices and standard error is looked at between them.
+  fn wait(self, timeout: Duration) -> Unit {
+    let started = self.clock.now()
+    var waited = 0
+    var waiting = true
+    while waiting {
+      let left = timeout.as_milliseconds() - self.clock.since(started).as_milliseconds().max(waited)
+      if ssh_channel_poll(self.channel, 1i32) != 0i32 || left <= 0 {
+        waiting = false
+      } else {
+        let slice = left.min(WAIT_SLICE)
+        waiting = ssh_channel_poll_timeout(self.channel, slice.try_to_i32().unwrap_or(0i32), 0i32) == 0i32
+        waited += slice
+      }
+    }
+  }
+
+  // Whether the server will send nothing more.
+  fn finished(self) -> Bool {
+    return ssh_is_connected(self.session) == 0i32
+      || ssh_channel_is_closed(self.channel) != 0i32
+      || ssh_channel_is_eof(self.channel) != 0i32
+  }
+}
+
+// What is buffered of one stream of `channel`, at most about `limit`
+// bytes.
+fn drain(channel: ssh_channel, is_stderr: i32, limit: Int) -> Bytes {
+  var buffer = CBuffer[u8].new(CHUNK)
+  var parts: List[Bytes] = []
+  var total = 0
+  var more = true
+  while more && total < limit {
+    let count = ssh_channel_read_nonblocking(channel, buffer.ptr().cast[Unit](), CHUNK.try_to_u32().unwrap_or(0u32), is_stderr)
+    if count <= 0i32 {
+      more = false
+    } else {
+      parts.push(Bytes.from_c_len(buffer.ptr(), Int.from(count).try_to_usize().unwrap_or(0usize)))
+      total += Int.from(count)
+    }
+  }
+  return Bytes.concat(parts)
+}
+
+// How the program on `channel` ended. It waits, for at most the
+// connection's timeout, until the server says or closes the channel.
+fn exit_state(channel: ssh_channel) -> ExitStatus {
+  let status = Out[u32].new()
+  let signal = Out[Ptr[u8]].new()
+  let core = Out[i32].new()
+  if ssh_channel_get_exit_state(channel, status, signal, core) != SSH_OK {
+    return Unknown
+  }
+  let name = signal.get()
+  if name.is_null() {
+    return Code(Int.from(status.get()))
+  }
+  let text = String.from_c(name).unwrap_or("")
+  ssh_string_free_char(name)
+  return Signal(text)
+}
+
+// Whether a step that failed after `elapsed` with libssh's `reason` ran
+// out of time. libssh has no code for it, and a clock that stands still
+// shows no time passing, so its wording counts too.
+fn timed_out(elapsed: Duration, timeout: Duration, reason: String) -> Bool {
+  return elapsed >= timeout || reason.contains("imeout") || reason.contains("imed out")
+}
+
+// A window dimension as libssh takes it.
+fn window(cells: Int) -> Result[i32, SshError] {
+  if cells < 1 || cells > MAX_WINDOW {
+    return Err(failure(Config, "a terminal is 1 to {MAX_WINDOW} cells wide and high, not {cells}"))
+  }
+  return Ok(cells.try_to_i32().unwrap_or(1i32))
+}
+
+// Whether C sees all of `text`: a NUL would cut it short.
+fn is_plain(text: String) -> Bool {
+  return !text.contains("\0")
+}
+
+// Whether `text` is a `SHA256:<base64>` fingerprint: 32 bytes, unpadded.
+fn is_fingerprint(text: String) -> Bool {
+  if !text.starts_with(PIN_PREFIX) || text.contains("=") {
+    return false
+  }
+  match base64.decode("{text[PIN_PREFIX.len()..]}=") {
+    Ok(digest) => return digest.len() == 32
+    Err(_) => return false
+  }
+}
+
+// Rejects a config libssh would read differently from how it is written.
+fn validate(config: ClientConfig) -> Result[Unit, SshError] {
+  // libssh takes `user@host` and URIs as a host; a host here is only a
+  // name or an address.
+  if config.host.is_empty() || config.host.len() > 255 || !is_plain(config.host) {
+    return Err(failure(Config, "the host is empty, longer than 255, or holds a NUL"))
+  }
+  for forbidden in ["@", "/", " ", "\t", "\n", "\r", "[", "]", "%"] {
+    if config.host.contains(forbidden) {
+      return Err(
+        failure(
+          Config,
+          "the host must be a name or an address, without spaces, `@`, `/`, `[`, `]`, or `%`"
+        )
+      )
+    }
+  }
+  if config.host.starts_with("-") {
+    return Err(failure(Config, "the host must not start with `-`"))
+  }
+  if config.port < 1 || config.port > 65535 {
+    return Err(failure(Config, "the port must be 1 to 65535, not {config.port}"))
+  }
+  if config.user.is_empty() || config.user.len() > 255 || !is_plain(config.user) {
+    return Err(failure(Config, "the user is empty, longer than 255, or holds a NUL"))
+  }
+  if config.timeout < Duration.milliseconds(1) || config.timeout > MAX_TIMEOUT {
+    return Err(failure(Config, "the timeout must be 1 ms to 24 hours"))
+  }
+  match config.host_key {
+    Strict(known_hosts) => validate_path(known_hosts, "known_hosts")?
+    AcceptNew(known_hosts) => validate_path(known_hosts, "known_hosts")?
+    Fingerprint(sha256) => {
+      if !is_fingerprint(sha256) {
+        return Err(failure(Config, "the pinned fingerprint must read SHA256:<43 base64 characters>"))
+      }
+    }
+  }
+  if config.auth.is_empty() {
+    return Err(failure(Config, "no authentication method is given"))
+  }
+  for method in config.auth {
+    match method {
+      KeyFile(path, passphrase) => {
+        validate_path(path, "key file")?
+        if !is_plain(passphrase.unwrap_or(Secret.new("")).text) {
+          return Err(failure(Config, "the passphrase holds a NUL"))
+        }
+      }
+      Agent => {
+      }
+      Password(password) => {
+        if !is_plain(password.text) || password.text.len() > MAX_TEXT {
+          return Err(failure(Config, "the password holds a NUL or is longer than {MAX_TEXT}"))
+        }
+      }
+    }
+  }
+  return Ok(Unit)
+}
+
+fn validate_path(path: Path, what: String) -> Result[Unit, SshError] {
+  let text = "{path}"
+  if text.is_empty() || text.len() > MAX_TEXT || !is_plain(text) {
+    return Err(failure(Config, "the {what} path is empty, longer than {MAX_TEXT}, or holds a NUL"))
+  }
+  return Ok(Unit)
+}
+
+fn set_text(session: ssh_session, option: ssh_options_e, text: String) -> Bool {
+  with value = CStr.from(text) {
+    return ssh_options_set(session, option, value.ptr().cast[Unit]()) == SSH_OK
+  }
+}
+
+fn set_long(session: ssh_session, option: ssh_options_e, number: Int) -> Bool {
+  var value = CBuffer[CLong].new(1)
+  value[0] = number
+  return ssh_options_set(session, option, value.ptr().cast[Unit]()) == SSH_OK
+}
+
+fn set_port(session: ssh_session, port: Int) -> Bool {
+  var value = CBuffer[u32].new(1)
+  value[0] = port.try_to_u32().unwrap_or(0u32)
+  return ssh_options_set(session, ssh_options_e.Port, value.ptr().cast[Unit]()) == SSH_OK
+}
+
+// Keeps libssh from reading `~/.ssh/config` and `/etc/ssh/ssh_config`.
+fn skip_config_files(session: ssh_session) -> Bool {
+  var process = CBuffer[u8].new(1)
+  process[0] = 0u8
+  return ssh_options_set(session, ssh_options_e.ProcessConfig, process.ptr().cast[Unit]()) == SSH_OK
+}
+
+// Sets the options of a new session. Nothing is read from the user's
+// `~/.ssh` or from `/etc/ssh`: no configuration file, no default
+// identities, and no known hosts but the policy's file.
+fn configure(session: ssh_session, config: ClientConfig) -> Result[Unit, SshError] {
+  var known_hosts = "/dev/null"
+  match config.host_key {
+    Strict(path) => known_hosts = "{path}"
+    AcceptNew(path) => known_hosts = "{path}"
+    Fingerprint(_) => {
+    }
+  }
+  let milliseconds = config.timeout.as_milliseconds()
+  let ok = skip_config_files(session)
+    && set_text(session, ssh_options_e.Host, config.host)
+    && set_text(session, ssh_options_e.User, config.user)
+    && set_port(session, config.port)
+    && set_text(session, ssh_options_e.Knownhosts, known_hosts)
+    && set_text(session, ssh_options_e.GlobalKnownhosts, "/dev/null")
+    && set_long(session, ssh_options_e.Timeout, milliseconds / 1000)
+    && set_long(session, ssh_options_e.TimeoutUsec, milliseconds % 1000 * 1000)
+  if !ok {
+    return Err(failure(Config, "libssh refused an option: {session_error(session)}"))
+  }
+  return Ok(Unit)
+}
+
+// What to do with a server whose key has `fingerprint`.
+#[derive(Eq)]
+type Verdict =
+  | Accept
+  // The policy trusts a first key: write it to `known_hosts`.
+  | Record
+  | Reject(kind: SshErrorKind, reason: String)
+
+// The verdict of a `known_hosts` policy on what libssh found in the file.
+fn judge_known(record_new: Bool, found: ssh_known_hosts_e, host: String, fingerprint: String) -> Verdict {
+  match found {
+    ssh_known_hosts_e.Ok => return Accept
+    ssh_known_hosts_e.Changed => {
+      return Reject(
+        HostKeyChanged,
+        "the host key of {host} changed: it is now {fingerprint}, and known_hosts records another"
+      )
+    }
+    ssh_known_hosts_e.Other => {
+      return Reject(
+        HostKeyChanged,
+        "{host} offers a key of another type ({fingerprint}) than the one known_hosts records for it",
+      )
+    }
+    ssh_known_hosts_e.Unknown => return unknown_host(record_new, host, fingerprint)
+    ssh_known_hosts_e.NotFound => return unknown_host(record_new, host, fingerprint)
+    ssh_known_hosts_e.Error => return Reject(KnownHosts, "cannot check {host} against known_hosts")
+  }
+}
+
+fn unknown_host(record_new: Bool, host: String, fingerprint: String) -> Verdict {
+  if record_new {
+    return Record
+  }
+  return Reject(HostKeyUnknown, "known_hosts has no key for {host}; it offers {fingerprint}")
+}
+
+// The verdict of a pinned fingerprint.
+fn judge_pinned(pinned: String, host: String, fingerprint: String) -> Verdict {
+  if pinned == fingerprint {
+    return Accept
+  }
+  return Reject(HostKeyChanged, "{host} offers the key {fingerprint}, not the pinned {pinned}")
+}
+
+// Applies the policy to the connected server's key and returns the key's
+// fingerprint.
+fn verify_host_key(session: ssh_session, config: ClientConfig) -> Result[String, SshError] {
+  let out = Out[ssh_key].new()
+  if ssh_get_server_publickey(session, out) != SSH_OK {
+    return Err(failure(Connect, "the server sent no host key"))
+  }
+  let key = out.get()
+  let print = fingerprint(key)
+  ssh_key_free(key)
+  let actual = print.ok_or(failure(Connect, "cannot hash the server's host key"))?
+  var verdict = Accept
+  match config.host_key {
+    Strict(_) => verdict = judge_known(false, ssh_session_is_known_server(session), config.host, actual)
+    AcceptNew(_) => verdict = judge_known(true, ssh_session_is_known_server(session), config.host, actual)
+    Fingerprint(sha256) => verdict = judge_pinned(sha256, config.host, actual)
+  }
+  match verdict {
+    Accept => return Ok(actual)
+    Record => {
+      if ssh_session_update_known_hosts(session) != SSH_OK {
+        return Err(failure(KnownHosts, "cannot record the key of {config.host}: {session_error(session)}"))
+      }
+      return Ok(actual)
+    }
+    Reject(kind, reason) => return Err(failure(kind, reason))
+  }
+}
+
+// The names of the methods in libssh's bit set `methods`.
+fn method_names(methods: i32) -> String {
+  var names: List[String] = []
+  if methods & SSH_AUTH_METHOD_PUBLICKEY != 0i32 {
+    names.push("publickey")
+  }
+  if methods & SSH_AUTH_METHOD_PASSWORD != 0i32 {
+    names.push("password")
+  }
+  if methods & SSH_AUTH_METHOD_INTERACTIVE != 0i32 {
+    names.push("keyboard-interactive")
+  }
+  if names.is_empty() {
+    return "none of the methods this client has"
+  }
+  return names.join(", ")
+}
+
+// How an attempt reads in the error when nothing let the client in. It
+// names the method and the key file, never a secret.
+fn describe(method: Auth) -> String {
+  match method {
+    KeyFile(path, _) => return "the key {path}"
+    Agent => return "the agent"
+    Password(_) => return "the password"
+  }
+}
+
+// What one refused attempt adds to the error.
+fn refusal(outcome: i32) -> String {
+  if outcome == SSH_AUTH_DENIED {
+    return "refused"
+  }
+  if outcome == SSH_AUTH_PARTIAL {
+    return "accepted, but the server asks for one more method"
+  }
+  return "failed"
+}
+
+// The error of a login no method completed.
+fn denied(user: String, attempts: List[String], offered: String) -> SshError {
+  return failure(Authentication, "{user} was not let in: {attempts.join("; ")}; the server accepts {offered}")
+}
+
+// Tries the methods of `config` in order.
+fn authenticate(session: ssh_session, clock: Clock, config: ClientConfig) -> Result[Unit, SshError] {
+  let started = clock.now()
+  // The `none` request is what makes the server list its methods.
+  if ssh_userauth_none(session, config.user) == SSH_AUTH_SUCCESS {
+    return Ok(Unit)
+  }
+  var attempts: List[String] = []
+  for method in config.auth {
+    let offered = ssh_userauth_list(session, config.user)
+    var outcome = SSH_AUTH_DENIED
+    match method {
+      KeyFile(path, passphrase) => {
+        if offered & SSH_AUTH_METHOD_PUBLICKEY == 0i32 {
+          attempts.push("{describe(method)}: the server takes no keys")
+          continue
+        }
+        match load_key(path, passphrase) {
+          Some(key) => {
+            outcome = ssh_userauth_publickey(session, config.user, key)
+            ssh_key_free(key)
+          }
+          None => {
+            attempts.push(
+              "{describe(method)}: cannot be read (not a private key, or the passphrase is wrong or missing)"
+            )
+            continue
+          }
+        }
+      }
+      Agent => {
+        if offered & SSH_AUTH_METHOD_PUBLICKEY == 0i32 {
+          attempts.push("{describe(method)}: the server takes no keys")
+          continue
+        }
+        outcome = ssh_userauth_agent(session, config.user)
+        if outcome == SSH_AUTH_DENIED {
+          attempts.push("{describe(method)}: no agent, or none of its keys was accepted")
+          continue
+        }
+      }
+      Password(password) => {
+        if offered & SSH_AUTH_METHOD_PASSWORD == 0i32 {
+          attempts.push("{describe(method)}: the server takes no passwords")
+          continue
+        }
+        outcome = ssh_userauth_password(session, config.user, password.text)
+      }
+    }
+    if outcome == SSH_AUTH_SUCCESS {
+      return Ok(Unit)
+    }
+    attempts.push("{describe(method)}: {refusal(outcome)}")
+    if ssh_is_connected(session) == 0i32 {
+      attempts.push("the server closed the connection")
+      break
+    }
+    let answered = outcome == SSH_AUTH_DENIED || outcome == SSH_AUTH_PARTIAL
+    if !answered && timed_out(clock.since(started), config.timeout, session_error(session)) {
+      return Err(failure(Timeout, "the server did not answer the login of {config.user} in {config.timeout}"))
+    }
+  }
+  var offered = "nothing more"
+  if ssh_is_connected(session) != 0i32 {
+    offered = method_names(ssh_userauth_list(session, config.user))
+  }
+  return Err(denied(config.user, attempts, offered))
+}
+
+// Reads a private key file. libssh is given no callback to ask for a
+// passphrase, so an encrypted key without one fails instead of prompting.
+fn load_key(path: Path, passphrase: Option[Secret]) -> Option[ssh_key] {
+  let out = Out[ssh_key].new()
+  var outcome = SSH_OK
+  match passphrase {
+    Some(secret) => {
+      with text = CStr.from(secret.text) {
+        outcome = ssh_pki_import_privkey_file("{path}", text.ptr(), Ptr.null(), Ptr.null(), out)
+      }
+    }
+    None => outcome = ssh_pki_import_privkey_file("{path}", Ptr.null(), Ptr.null(), Ptr.null(), out)
+  }
+  if outcome != SSH_OK || out.get().is_null() {
+    return None
+  }
+  return Some(out.get())
+}
+
+fn test_config() -> ClientConfig {
+  return ClientConfig {
+    host: "example.org",
+    port: 22,
+    user: "ann",
+    timeout: Duration.seconds(5),
+    host_key: Strict(Path.from("known_hosts")),
+    auth: [KeyFile(Path.from("id_ed25519"), None)],
+  }
+}
+
+// `ok`, or the error of validating `config`.
+fn validated(config: ClientConfig) -> String {
+  match validate(config) {
+    Ok(_) => return "ok"
+    Err(error) => return "{error}"
+  }
+}
+
+fn verdict(found: Verdict) -> String {
+  match found {
+    Accept => return "accept"
+    Record => return "record"
+    Reject(kind, _) => return "reject {kind}"
+  }
+}
+
+#[test("a secret never shows in text")]
+fn secrets_are_hidden() -> Unit {
+  let methods = [
+    Password(Secret.new("hunter2")),
+    KeyFile(Path.from("key"), Some(Secret.new("open sesame"))),
+    Agent,
+  ]
+  expect.equal("{methods}", "[Password(<secret>), KeyFile(key, Some(<secret>)), Agent]")
+  expect.equal(methods.map(describe), ["the password", "the key key", "the agent"])
+  expect.equal(Secret.new("a") == Secret.new("a"), true)
+}
+
+#[test("a config is validated before anything is sent")]
+fn config_validation() -> Unit {
+  expect.equal(validated(test_config()), "ok")
+  var config = test_config()
+  config.host = ""
+  expect.equal(validated(config), "Config: the host is empty, longer than 255, or holds a NUL")
+  config.host = "ann@example.org"
+  expect.equal(
+    validated(config),
+    "Config: the host must be a name or an address, without spaces, `@`, `/`, `[`, `]`, or `%`"
+  )
+  config.host = "-oProxyCommand=id"
+  expect.equal(validated(config), "Config: the host must not start with `-`")
+  config.host = "exam\0ple.org"
+  expect.equal(validated(config), "Config: the host is empty, longer than 255, or holds a NUL")
+  config.host = "::1"
+  expect.equal(validated(config), "ok")
+  config.port = 0
+  expect.equal(validated(config), "Config: the port must be 1 to 65535, not 0")
+  config.port = 65536
+  expect.equal(validated(config), "Config: the port must be 1 to 65535, not 65536")
+  config.port = 65535
+  config.user = ""
+  expect.equal(validated(config), "Config: the user is empty, longer than 255, or holds a NUL")
+  config.user = "ann"
+  config.timeout = Duration.milliseconds(0)
+  expect.equal(validated(config), "Config: the timeout must be 1 ms to 24 hours")
+  config.timeout = Duration.hours(25)
+  expect.equal(validated(config), "Config: the timeout must be 1 ms to 24 hours")
+  config.timeout = Duration.milliseconds(1)
+  config.auth = []
+  expect.equal(validated(config), "Config: no authentication method is given")
+  config.auth = [Password(Secret.new("a\0b"))]
+  expect.equal(validated(config), "Config: the password holds a NUL or is longer than 4096")
+  config.auth = [KeyFile(Path.from("key"), Some(Secret.new("a\0b")))]
+  expect.equal(validated(config), "Config: the passphrase holds a NUL")
+  config.auth = [KeyFile(Path.from(""), None)]
+  expect.equal(validated(config), "Config: the key file path is empty, longer than 4096, or holds a NUL")
+  config.auth = [Agent, Password(Secret.new("pw"))]
+  expect.equal(validated(config), "ok")
+  config.host_key = AcceptNew(Path.from(""))
+  expect.equal(validated(config), "Config: the known_hosts path is empty, longer than 4096, or holds a NUL")
+  config.host_key = Fingerprint("WvfuSi+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni8")
+  expect.equal(validated(config), "Config: the pinned fingerprint must read SHA256:<43 base64 characters>")
+}
+
+#[test("a pinned fingerprint is SHA256 and 32 bytes of unpadded base64")]
+fn fingerprint_format() -> Unit {
+  expect.equal(is_fingerprint("SHA256:WvfuSi+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni8"), true)
+  expect.equal(is_fingerprint("SHA256:WvfuSi+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni8="), false)
+  expect.equal(is_fingerprint("SHA256:WvfuSi+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni"), false)
+  expect.equal(is_fingerprint("SHA256:WvfuSi+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni8AAAA"), false)
+  expect.equal(is_fingerprint("SHA256:Wvfu Si+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni"), false)
+  expect.equal(is_fingerprint("MD5:16:27:ac:a5:76:28:2d:36:63:1b:56:4d:eb:df:a6:48"), false)
+  expect.equal(is_fingerprint("sha256:WvfuSi+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni8"), false)
+  expect.equal(is_fingerprint("SHA256:"), false)
+  expect.equal(is_fingerprint(""), false)
+}
+
+#[test("Strict accepts only a recorded key")]
+fn strict_policy() -> Unit {
+  let print = "SHA256:new"
+  expect.equal(verdict(judge_known(false, ssh_known_hosts_e.Ok, "h", print)), "accept")
+  expect.equal(verdict(judge_known(false, ssh_known_hosts_e.Unknown, "h", print)), "reject HostKeyUnknown")
+  expect.equal(verdict(judge_known(false, ssh_known_hosts_e.NotFound, "h", print)), "reject HostKeyUnknown")
+  expect.equal(verdict(judge_known(false, ssh_known_hosts_e.Changed, "h", print)), "reject HostKeyChanged")
+  expect.equal(verdict(judge_known(false, ssh_known_hosts_e.Other, "h", print)), "reject HostKeyChanged")
+  expect.equal(verdict(judge_known(false, ssh_known_hosts_e.Error, "h", print)), "reject KnownHosts")
+}
+
+#[test("AcceptNew records an unknown key and still refuses a changed one")]
+fn accept_new_policy() -> Unit {
+  let print = "SHA256:new"
+  expect.equal(verdict(judge_known(true, ssh_known_hosts_e.Ok, "h", print)), "accept")
+  expect.equal(verdict(judge_known(true, ssh_known_hosts_e.Unknown, "h", print)), "record")
+  expect.equal(verdict(judge_known(true, ssh_known_hosts_e.NotFound, "h", print)), "record")
+  expect.equal(verdict(judge_known(true, ssh_known_hosts_e.Changed, "h", print)), "reject HostKeyChanged")
+  expect.equal(verdict(judge_known(true, ssh_known_hosts_e.Other, "h", print)), "reject HostKeyChanged")
+  expect.equal(verdict(judge_known(true, ssh_known_hosts_e.Error, "h", print)), "reject KnownHosts")
+  expect.equal(
+    judge_known(true, ssh_known_hosts_e.Changed, "h", print),
+    Reject(
+      HostKeyChanged,
+      "the host key of h changed: it is now SHA256:new, and known_hosts records another"
+    ),
+  )
+  expect.equal(
+    judge_known(false, ssh_known_hosts_e.Unknown, "h", print),
+    Reject(HostKeyUnknown, "known_hosts has no key for h; it offers SHA256:new"),
+  )
+}
+
+#[test("a pinned fingerprint accepts that key only")]
+fn pinned_policy() -> Unit {
+  expect.equal(judge_pinned("SHA256:a", "h", "SHA256:a"), Accept)
+  expect.equal(
+    judge_pinned("SHA256:a", "h", "SHA256:b"),
+    Reject(HostKeyChanged, "h offers the key SHA256:b, not the pinned SHA256:a"),
+  )
+}
+
+#[test("a failed login says what was tried and what the server accepts")]
+fn login_errors() -> Unit {
+  expect.equal(method_names(SSH_AUTH_METHOD_PUBLICKEY | SSH_AUTH_METHOD_PASSWORD), "publickey, password")
+  expect.equal(method_names(SSH_AUTH_METHOD_INTERACTIVE), "keyboard-interactive")
+  expect.equal(method_names(0i32), "none of the methods this client has")
+  expect.equal(refusal(SSH_AUTH_DENIED), "refused")
+  expect.equal(refusal(SSH_AUTH_PARTIAL), "accepted, but the server asks for one more method")
+  expect.equal(refusal(-1i32), "failed")
+  let error = denied("ann", ["the key id: refused", "the password: refused"], "publickey")
+  expect.equal(error.kind, Authentication)
+  expect.equal(
+    error.message,
+    "ann was not let in: the key id: refused; the password: refused; the server accepts publickey"
+  )
+}
+
+#[test("a step ran out of time by the clock or by libssh's word")]
+fn timeouts_are_recognized() -> Unit {
+  let limit = Duration.seconds(2)
+  expect.equal(timed_out(Duration.seconds(2), limit, "Connection refused"), true)
+  expect.equal(timed_out(Duration.seconds(1), limit, "Connection refused"), false)
+  expect.equal(timed_out(Duration.seconds(0), limit, "Timeout connecting to 127.0.0.1"), true)
+  expect.equal(timed_out(Duration.seconds(0), limit, "Connection timed out"), true)
+}
+
+#[test("a window is 1 to 1000 cells each way")]
+fn window_bounds() -> Unit {
+  expect.equal(window(80).ok(), Some(80i32))
+  expect.equal(window(1000).ok(), Some(1000i32))
+  expect.equal(window(0).is_err(), true)
+  expect.equal(window(1001).is_err(), true)
+  expect.equal(window(-5).err().map(|error| error.kind), Some(Config))
+}
+
+// The kind `connect` fails with.
+fn connect_failure(context: TestContext, config: ClientConfig) -> String {
+  match connect(context.net, context.fs, context.clock, config) {
+    Ok(client) => return "connected to {client.host_key()}"
+    Err(error) => return "{error.kind}"
+  }
+}
+
+#[test("connect refuses a bad config and a missing key file without connecting")]
+fn connect_checks_first(context: TestContext) -> Unit {
+  var config = test_config()
+  config.port = 70000
+  expect.equal(connect_failure(context, config), "Config")
+  config.port = 22
+  config.auth = [KeyFile(context.temp_dir() / "no_such_key", None)]
+  expect.equal(connect_failure(context, config), "Config")
+}
+
+#[test("a closed port fails with Connect, a silent server with Timeout")]
+fn connect_failures(context: TestContext) -> Unit {
+  with listener = context.net.tcp_listen("127.0.0.1:0").expect_ok("listen") {
+    var config = test_config()
+    config.host = "127.0.0.1"
+    config.port = Int.from(listener.local_addr().expect_ok("address").port)
+    config.timeout = Duration.milliseconds(300)
+    config.host_key = Strict(context.temp_dir() / "known_hosts")
+    config.auth = [Agent]
+    let started = context.clock.now()
+    // The listener never answers: the connection opens and no banner comes.
+    expect.equal(connect_failure(context, config), "Timeout")
+    expect.equal(context.clock.since(started) < Duration.seconds(5), true)
+  }
+  var config = test_config()
+  config.host = "127.0.0.1"
+  config.port = 1
+  config.auth = [Agent]
+  expect.equal(connect_failure(context, config), "Connect")
+}

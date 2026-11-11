@@ -2,7 +2,7 @@
 // whose generated parameter types cannot say what the safe layer passes,
 // and the one libc call it needs.
 
-use std.ffi.{CStr, Ptr}
+use std.ffi.{CStr, Out, Ptr}
 use pkg.sys.libssh.ssh_key
 
 extern "C" {
@@ -15,6 +15,16 @@ extern "C" {
     auth_fn: Ptr[Unit],
     auth_data: Ptr[Unit],
     filename: CStr
+  ) -> i32
+
+  // The same for reading: a NULL `passphrase` with a NULL `auth_fn` makes
+  // an encrypted key fail instead of prompting on the terminal.
+  pub fn ssh_pki_import_privkey_file(
+    filename: CStr,
+    passphrase: Ptr[u8],
+    auth_fn: Ptr[Unit],
+    auth_data: Ptr[Unit],
+    pkey: Out[ssh_key]
   ) -> i32
 
   // libc: the file mode creation mask of the process.
