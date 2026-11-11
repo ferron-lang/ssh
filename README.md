@@ -15,14 +15,21 @@ The two talk to each other and to OpenSSH (`scripts/interop` checks both).
 
 ## Use
 
+Add it to the `anvil.toml` of a package as a git dependency pinned by tag:
+
 ```toml
 [dependencies]
-ssh = { path = "../ssh" }
+ssh = { git = "https://github.com/ferron-lang/ssh", tag = "v0.1.0" }
 ```
 
-and import it as `ssh`. Programs using the package link the system
-`libssh` (`[native] link` in this package's `anvil.toml`), so `cc -lssh`
-must find version 0.12 or newer:
+and import it as `ssh`. It needs `ferron` 0.10.0-alpha.2 or newer.
+Versions stay `v0.x` until the API settles: the minor version marks
+changes that may break callers, the patch version fixes; `CHANGELOG.md`
+lists them.
+
+Programs using the package link the system `libssh` (`[native] link` in
+this package's `anvil.toml`), so `cc -lssh` must find version 0.12 or
+newer:
 
 | System | Install |
 |---|---|
@@ -247,6 +254,19 @@ layer calls (`ignore = "."` plus a `require` list), so the output is the
 same for the libssh 0.12.0 and 0.12.2 headers; using another function
 means adding it to `require`. `src/sys/hand.fer` declares by hand the two
 key file functions whose passphrase may be NULL, and libc's `umask`.
+
+## CI
+
+`.github/workflows/ci.yml` builds the compiler from `ferron-lang/ferron` at
+`FERRON_REF`, a release tag or a commit, installs `clang` and OpenSSH,
+builds libssh at `LIBSSH_VERSION` from its sources (Ubuntu's runners ship
+0.10 and 0.11), and runs `anvil check`, `anvil test` (checking that the
+runtime reports `live_handles=0` afterwards), `anvil fmt --check`, the
+same two checks of `examples/probe`, `scripts/interop`, and
+`anvil ffi gen --check`. `ferron-lang/ferron` is private, so the workflow
+checks it out with the repository secret `FERRON_REPO_TOKEN`: a fine-grained
+personal access token with read access to the contents of
+`ferron-lang/ferron`.
 
 ## License
 

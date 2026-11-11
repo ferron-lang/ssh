@@ -1,8 +1,0 @@
-version = 1
-root = "."
-
-[[packages]]
-source = "."
-name = "ssh"
-version = "0.1.0"
-fingerprint = "fnv1a64:746e5c39d5408bdf"

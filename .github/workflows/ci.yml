@@ -1,0 +1,74 @@
+name: CI
+
+on:
+  push:
+  pull_request:
+
+env:
+  # The ferron-lang/ferron release tag (`vX.Y.Z-alpha.N`) or commit this
+  # package is tested with; move it together with the `ferron` requirement
+  # in anvil.toml.
+  FERRON_REF: v0.10.0-alpha.2
+  # The libssh release the package is built and its binding checked with.
+  # The runner's own libssh-dev is too old (0.10 on Ubuntu 24.04, 0.11 on
+  # 26.04; the package needs 0.12), so CI builds this one from its sources.
+  LIBSSH_VERSION: 0.12.2
+  LIBSSH_SHA256: 49560f677d96e3706a904ac2de1116e25f3680937d51e5c92198fcba4a1c1e9f
+
+jobs:
+  check:
+    runs-on: ubuntu-latest
+    timeout-minutes: 30
+    steps:
+      - uses: actions/checkout@v4
+      - name: Check out the compiler
+        uses: actions/checkout@v4
+        with:
+          repository: ferron-lang/ferron
+          ref: ${{ env.FERRON_REF }}
+          # ferron-lang/ferron is private; README.md names the secret.
+          token: ${{ secrets.FERRON_REPO_TOKEN }}
+          path: .ferron
+      # clang reads the headers for `anvil ffi gen`; CMake, OpenSSL, and
+      # zlib build libssh; OpenSSH is the other side of scripts/interop.
+      - name: Install clang, OpenSSH, and what libssh builds with
+        run: |
+          sudo apt-get update
+          sudo apt-get install -y clang cmake libssl-dev zlib1g-dev openssh-server openssh-client
+          dpkg-query -W clang cmake libssl-dev openssh-server
+      - name: Build libssh ${{ env.LIBSSH_VERSION }}
+        run: |
+          curl -fsSL -o "$RUNNER_TEMP/libssh.tar.xz" "https://www.libssh.org/files/${LIBSSH_VERSION%.*}/libssh-$LIBSSH_VERSION.tar.xz"
+          echo "$LIBSSH_SHA256  $RUNNER_TEMP/libssh.tar.xz" | sha256sum -c -
+          tar -xf "$RUNNER_TEMP/libssh.tar.xz" -C "$RUNNER_TEMP"
+          cmake -S "$RUNNER_TEMP/libssh-$LIBSSH_VERSION" -B "$RUNNER_TEMP/libssh-build" \
+            -DCMAKE_INSTALL_PREFIX=/usr -DCMAKE_BUILD_TYPE=Release -DWITH_EXAMPLES=OFF -DWITH_GSSAPI=OFF
+          cmake --build "$RUNNER_TEMP/libssh-build" -j "$(nproc)"
+          sudo cmake --install "$RUNNER_TEMP/libssh-build"
+          sudo ldconfig
+          grep -E 'define LIBSSH_VERSION_(MAJOR|MINOR|MICRO)' /usr/include/libssh/libssh_version.h
+      - name: Build anvil
+        working-directory: .ferron
+        run: |
+          scripts/build-anvil --release
+          echo "$PWD/target/release" >> "$GITHUB_PATH"
+      - run: anvil check
+      # The tests close every session they open; the runtime's handle
+      # metrics confirm nothing they used is left alive.
+      - name: anvil test
+        run: |
+          FERRON_NATIVE_HANDLE_METRICS_PATH="$RUNNER_TEMP/handles.txt" anvil test
+          grep -x live_handles=0 "$RUNNER_TEMP/handles.txt"
+      - run: anvil fmt --check
+      - name: Check the probe example
+        working-directory: examples/probe
+        run: |
+          anvil check
+          anvil fmt --check
+      # The client against a private sshd and against the package's own
+      # server, on 127.0.0.1 ports 2300 and 2301.
+      - name: scripts/interop
+        run: scripts/interop
+      # Last: on a mismatch it regenerates src/sys/ to show the difference.
+      - name: anvil ffi gen --check
+        run: anvil ffi gen --check || { anvil ffi gen; git diff; exit 1; }
