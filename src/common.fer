@@ -1,0 +1,59 @@
+// What the server and the client both need from libssh: its result codes,
+// its last error as text, and a key's fingerprint.
+
+use std.bytes.Bytes
+use std.ffi.{Out, Ptr}
+use pkg.sys.libssh.{
+  ssh_clean_pubkey_hash,
+  ssh_get_error,
+  ssh_get_fingerprint_hash,
+  ssh_get_publickey_hash,
+  ssh_key,
+  ssh_publickey_hash_type,
+  ssh_session,
+  ssh_string_free_char
+}
+
+pub(pkg) const SSH_OK: i32 = 0i32
+pub(pkg) const SSH_ERROR: i32 = -1i32
+pub(pkg) const SSH_AGAIN: i32 = -2i32
+pub(pkg) const SSH_EOF: i32 = -127i32
+pub(pkg) const SSH_AUTH_SUCCESS: i32 = 0i32
+pub(pkg) const SSH_AUTH_DENIED: i32 = 1i32
+pub(pkg) const SSH_AUTH_PARTIAL: i32 = 2i32
+pub(pkg) const SSH_AUTH_INFO: i32 = 3i32
+pub(pkg) const SSH_AUTH_METHOD_PASSWORD: i32 = 2i32
+pub(pkg) const SSH_AUTH_METHOD_PUBLICKEY: i32 = 4i32
+pub(pkg) const SSH_AUTH_METHOD_INTERACTIVE: i32 = 16i32
+
+// libssh's message for the last failure of `session`.
+pub(pkg) fn session_error(session: ssh_session) -> String {
+  return error_text(session.cast[Unit]())
+}
+
+// libssh's message for the last failure of a session or a bind.
+pub(pkg) fn error_text(source: Ptr[Unit]) -> String {
+  let text = String.from_c(ssh_get_error(source)).unwrap_or("<not UTF-8>")
+  if text.is_empty() {
+    return "libssh gave no reason"
+  }
+  return text
+}
+
+// OpenSSH's `SHA256:<base64>` fingerprint of `key`.
+pub(pkg) fn fingerprint(key: ssh_key) -> Option[String] {
+  let hash = Out[Ptr[u8]].new()
+  let length = Out[usize].new()
+  if ssh_get_publickey_hash(key, ssh_publickey_hash_type.Sha256, hash, length) != SSH_OK {
+    return None
+  }
+  let digest = Bytes.from_c_len(hash.get(), length.get())
+  ssh_clean_pubkey_hash(hash)
+  let text = ssh_get_fingerprint_hash(ssh_publickey_hash_type.Sha256, digest.to_list(), length.get())
+  if text.is_null() {
+    return None
+  }
+  let result = String.from_c(text)
+  ssh_string_free_char(text)
+  return result.ok()
+}

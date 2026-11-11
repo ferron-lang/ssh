@@ -8,9 +8,10 @@
 
 use std.bytes.Bytes
 use std.collections.Map
-use std.ffi.{CBuffer, CHandle, Out, Ptr}
+use std.ffi.{CBuffer, CHandle, Ptr}
 use std.ref.Ref
 use std.time.Duration
+use pkg.common.{SSH_AUTH_DENIED, SSH_AUTH_INFO, SSH_AUTH_SUCCESS, SSH_ERROR, SSH_OK, fingerprint}
 use pkg.error.{SshError, SshErrorKind, failure}
 use pkg.sys.callbacks.ssh_channel_callbacks_struct
 use pkg.sys.libssh.{
@@ -18,29 +19,20 @@ use pkg.sys.libssh.{
   ssh_channel_is_open,
   ssh_channel_new,
   ssh_channel_write,
-  ssh_clean_pubkey_hash,
   ssh_event,
   ssh_event_dopoll,
-  ssh_get_fingerprint_hash,
-  ssh_get_publickey_hash,
   ssh_is_connected,
   ssh_key,
   ssh_key_struct,
   ssh_key_type,
   ssh_key_type_to_char,
   ssh_message,
-  ssh_publickey_hash_type,
   ssh_session,
   ssh_string_free_char
 }
 use pkg.sys.callbacks.ssh_set_channel_callbacks
 use pkg.sys.server.{ssh_message_auth_interactive_request, ssh_message_auth_kbdint_is_response, ssh_message_auth_user}
 
-pub(pkg) const SSH_OK: i32 = 0i32
-pub(pkg) const SSH_ERROR: i32 = -1i32
-pub(pkg) const SSH_AUTH_SUCCESS: i32 = 0i32
-pub(pkg) const SSH_AUTH_DENIED: i32 = 1i32
-pub(pkg) const SSH_AUTH_INFO: i32 = 3i32
 const SSH_PUBLICKEY_STATE_NONE: i8 = 0i8
 const SSH_PUBLICKEY_STATE_VALID: i8 = 1i8
 
@@ -202,24 +194,6 @@ impl Session {
     let channel = self.state.value.channel
     return ssh_is_connected(self.session) != 0i32 && !channel.is_null() && ssh_channel_is_open(channel) != 0i32
   }
-}
-
-// OpenSSH's `SHA256:<base64>` fingerprint of `key`.
-fn fingerprint(key: ssh_key) -> Option[String] {
-  let hash = Out[Ptr[u8]].new()
-  let length = Out[usize].new()
-  if ssh_get_publickey_hash(key, ssh_publickey_hash_type.Sha256, hash, length) != SSH_OK {
-    return None
-  }
-  let digest = Bytes.from_c_len(hash.get(), length.get())
-  ssh_clean_pubkey_hash(hash)
-  let text = ssh_get_fingerprint_hash(ssh_publickey_hash_type.Sha256, digest.to_list(), length.get())
-  if text.is_null() {
-    return None
-  }
-  let result = String.from_c(text)
-  ssh_string_free_char(text)
-  return result.ok()
 }
 
 // `publickey`: any key is accepted, and proving it is what identifies the

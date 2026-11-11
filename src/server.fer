@@ -10,10 +10,9 @@ use std.ffi.{CBuffer, CFn, CHandle, CStr, Out, Ptr}
 use std.fs.{Fs, Path}
 use std.ref.Ref
 use std.time.{Clock, Duration}
+use pkg.common.{SSH_AGAIN, SSH_AUTH_METHOD_INTERACTIVE, SSH_AUTH_METHOD_PUBLICKEY, SSH_ERROR, SSH_OK, error_text}
 use pkg.error.{HostKey, Listen, SshError, failure}
 use pkg.session.{
-  SSH_ERROR,
-  SSH_OK,
   Session,
   State,
   on_auth_kbdint,
@@ -42,7 +41,6 @@ use pkg.sys.libssh.{
   ssh_event_new,
   ssh_event_remove_session,
   ssh_free,
-  ssh_get_error,
   ssh_init,
   ssh_is_connected,
   ssh_key,
@@ -66,9 +64,6 @@ use pkg.sys.server.{
   ssh_set_auth_methods
 }
 
-const SSH_AGAIN: i32 = -2i32
-const SSH_AUTH_METHOD_PUBLICKEY: i32 = 4i32
-const SSH_AUTH_METHOD_INTERACTIVE: i32 = 16i32
 const POLLIN: i16 = 1i16
 // How long a client has to end the connection after its channel closed.
 const CLOSE_TIMEOUT: Duration = Duration.seconds(2)
@@ -191,7 +186,7 @@ fn on_listener_ready(_fd: i32, _events: i32, _data: Ptr[Unit]) -> i32 {
 }
 
 fn last_error(bind: ssh_bind) -> String {
-  return String.from_c(ssh_get_error(bind.cast[Unit]())).unwrap_or("<not UTF-8>")
+  return error_text(bind.cast[Unit]())
 }
 
 fn set_text(bind: Bind, option: ssh_bind_options_e, text: String) -> Bool {
