@@ -10,12 +10,22 @@ use std.ffi.{CBuffer, CFn, CHandle, CStr, Out, Ptr}
 use std.fs.{Fs, Path}
 use std.ref.Ref
 use std.time.{Clock, Duration}
-use pkg.common.{SSH_AGAIN, SSH_AUTH_METHOD_INTERACTIVE, SSH_AUTH_METHOD_PUBLICKEY, SSH_ERROR, SSH_OK, error_text}
+use pkg.common.{
+  SSH_AGAIN,
+  SSH_AUTH_METHOD_INTERACTIVE,
+  SSH_AUTH_METHOD_PASSWORD,
+  SSH_AUTH_METHOD_PUBLICKEY,
+  SSH_ERROR,
+  SSH_OK,
+  error_text
+}
 use pkg.error.{HostKey, Listen, SshError, failure}
 use pkg.session.{
   Session,
   State,
+  PasswordCheck,
   on_auth_kbdint,
+  on_auth_password,
   on_auth_pubkey,
   on_channel_open,
   on_close,
@@ -88,6 +98,9 @@ pub struct Config {
   pub max_connections: Int,
   /// Whether a client without a key comes in as `Identity.Guest`.
   pub allow_guests: Bool,
+  /// Lets clients in by user name and password when it says so; `None`
+  /// refuses passwords.
+  pub password: Option[PasswordCheck],
   /// How long a client has to authenticate and ask for a shell.
   pub login_timeout: Duration,
 }
@@ -116,9 +129,16 @@ struct RawSession {
 type ConnectionMsg: send =
   | Start(raw: RawSession)
 
-actor Connection(clock: Clock, allow_guests: Bool, login_timeout: Duration, handler: Handler, slots: Receiver[Unit]) receives ConnectionMsg {
+actor Connection(
+  clock: Clock,
+  allow_guests: Bool,
+  password: Option[PasswordCheck],
+  login_timeout: Duration,
+  handler: Handler,
+  slots: Receiver[Unit]
+) receives ConnectionMsg {
   on Start(raw) {
-    run(clock, allow_guests, login_timeout, handler, raw)
+    run(clock, allow_guests, password, login_timeout, handler, raw)
     // Gives back the slot `serve` took for this connection.
     slots.receive()?
     exit
@@ -169,7 +189,9 @@ fn accept_loop(actors: ActorSystem, clock: Clock, config: Config, handler: Handl
         ssh_disconnect(raw.ptr)
         continue
       }
-      let connection = scope.spawn_pinned(Connection(clock, config.allow_guests, config.login_timeout, handler, slots.receiver))?
+      let connection = scope.spawn_pinned(
+        Connection(clock, config.allow_guests, config.password, config.login_timeout, handler, slots.receiver)
+      )?
       connection.send(Start(move raw))?
     }
   }
@@ -239,8 +261,15 @@ fn ensure_host_key(fs: Fs, path: Path) -> Result[Unit, SshError] {
 }
 
 // Serves one connection: key exchange, authentication, then the handler.
-fn run(clock: Clock, allow_guests: Bool, login_timeout: Duration, handler: Handler, raw: RawSession) -> Unit {
-  let state = Ref.new(State.new(allow_guests))
+fn run(
+  clock: Clock,
+  allow_guests: Bool,
+  password: Option[PasswordCheck],
+  login_timeout: Duration,
+  handler: Handler,
+  raw: RawSession
+) -> Unit {
+  let state = Ref.new(State.new(allow_guests, password))
   with handle = CHandle.new(state) {
     var channel_callbacks = ssh_channel_callbacks_struct.zeroed()
     channel_callbacks.size = CHANNEL_CALLBACKS_SIZE
@@ -262,6 +291,10 @@ fn run(clock: Clock, allow_guests: Bool, login_timeout: Duration, handler: Handl
     server_callbacks.channel_open_request_session_function = CFn.from(on_channel_open)
 
     var methods = SSH_AUTH_METHOD_PUBLICKEY
+    if password.is_some() {
+      server_callbacks.auth_password_function = CFn.from(on_auth_password)
+      methods = methods | SSH_AUTH_METHOD_PASSWORD
+    }
     if allow_guests {
       methods = methods | SSH_AUTH_METHOD_INTERACTIVE
     }

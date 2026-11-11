@@ -29,6 +29,7 @@ fn main(env: Env) -> Result[Unit, SshError] {
     host_key: Path.from("host_key"),
     max_connections: 64,
     allow_guests: true,
+    password: None,
     login_timeout: Duration.seconds(60),
   }
   return serve(env.actors, env.clock, env.fs, config, fn(session: mut Session) -> Unit {
@@ -56,7 +57,9 @@ fn main(env: Env) -> Result[Unit, SshError] {
   prints, and it names the same client on every connection. With
   `allow_guests`, a client without a key comes in through
   `keyboard-interactive` with no prompt as `Guest`. `session.user()` is
-  whatever name the client typed and proves nothing.
+  whatever name the client typed and proves nothing. With
+  `password: Some(check)`, `check(user, password)` decides who comes in by
+  password, as `Password(user)`; a connection gets three attempts.
 - **The terminal.** `session.term()` and `session.size()` come from the
   client's `pty-req`, `session.variable("COLORTERM")` from its `SendEnv`.
   `poll` returns the bytes it typed (feed them to a `std.term.Decoder`),
