@@ -6,12 +6,32 @@ use std.error.Error
 /// Why an SSH operation failed.
 #[derive(Eq, Hash)]
 pub type SshErrorKind =
-  /// The host key could not be generated, written, or loaded.
+  /// The server's own host key could not be generated, written, or loaded.
   | HostKey
   /// The address could not be bound or listened on.
   | Listen
   /// The connection is closed.
   | Closed
+  /// A `ClientConfig` or an argument is not usable; nothing was sent.
+  | Config
+  /// The server could not be reached, or the key exchange with it failed.
+  | Connect
+  /// A step took longer than its timeout.
+  | Timeout
+  /// The server's host key is not recorded, and the policy records none.
+  | HostKeyUnknown
+  /// The server's host key is not the one recorded or pinned for it:
+  /// another server answers, or its key was replaced.
+  | HostKeyChanged
+  /// The `known_hosts` file could not be read or written.
+  | KnownHosts
+  /// No authentication method let the client in.
+  | Authentication
+  /// The server refused a channel or a request on it (a command, a
+  /// terminal, a shell).
+  | Channel
+  /// A command wrote more than the caller allowed.
+  | TooLarge
   /// The actor runtime failed (a closed channel, a cancelled scope).
   | Actor
 
@@ -40,6 +60,36 @@ impl FromError[ActorError] for SshError {
 
 pub(pkg) fn failure(kind: SshErrorKind, message: String) -> SshError {
   return SshError { kind: kind, message: message }
+}
+
+#[test("every kind displays as its name")]
+fn kinds_display_as_names() -> Unit {
+  let kinds = [
+    HostKey,
+    Listen,
+    SshErrorKind.Closed,
+    Config,
+    Connect,
+    Timeout,
+    HostKeyUnknown,
+    HostKeyChanged,
+    KnownHosts,
+    Authentication,
+    Channel,
+    TooLarge,
+    Actor,
+  ]
+  expect.equal(
+    "{kinds}",
+    "[HostKey, Listen, Closed, Config, Connect, Timeout, HostKeyUnknown, HostKeyChanged, KnownHosts, Authentication, Channel, TooLarge, Actor]",
+  )
+}
+
+#[test("an actor failure converts with its message")]
+fn actor_errors_convert() -> Unit {
+  let error = failure(Actor, "the scope was cancelled")
+  expect.equal(error.kind, Actor)
+  expect.equal("{error}", "Actor: the scope was cancelled")
 }
 
 #[test("an error displays its kind and message")]
