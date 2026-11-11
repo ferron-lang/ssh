@@ -612,6 +612,10 @@ fn set_text(session: ssh_session, option: ssh_options_e, text: String) -> Bool {
   }
 }
 
+// shortcut: a buffer whose `ptr()` is taken in the right operand of `&&`
+// passes `anvil check` and fails `anvil build` (F1201, "MIR ownership
+// mismatch"), so every option that needs a buffer has a function of its
+// own and `configure` chains the calls; inline them once that builds.
 fn set_long(session: ssh_session, option: ssh_options_e, number: Int) -> Bool {
   var value = CBuffer[CLong].new(1)
   value[0] = number
