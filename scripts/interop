@@ -1,0 +1,285 @@
+#!/usr/bin/env bash
+# Checks `ssh.client` against a real OpenSSH server and against this
+# package's own `ssh.server`, through the `probe` example.
+#
+#   scripts/interop
+#
+# It builds `examples/probe`, starts a private unprivileged `sshd` on
+# 127.0.0.1 port 2300 and the probe's echo server on port 2301 (set
+# SSH_INTEROP_PORT to move the pair), and prints `ok` or `FAIL` for each
+# check; it exits with status 1 when a check failed. Every file it uses
+# (keys, known_hosts, the sshd configuration) is in a temporary directory
+# that it removes, and it stops the processes it started. It never reads
+# or writes `~/.ssh`. ANVIL names the `anvil` to build with.
+set -u
+
+root=$(cd "$(dirname "$0")/.." && pwd)
+anvil=${ANVIL:-anvil}
+sshd_port=${SSH_INTEROP_PORT:-2300}
+self_port=$((sshd_port + 1))
+user=$(id -un)
+work=$(mktemp -d)
+pids=()
+failures=0
+checks=0
+
+cleanup() {
+  for pid in "${pids[@]}"; do
+    kill "$pid" 2>/dev/null
+    wait "$pid" 2>/dev/null
+  done
+  rm -rf "$work"
+}
+trap cleanup EXIT
+
+report() {
+  checks=$((checks + 1))
+  if [ "$1" = ok ]; then
+    echo "ok   $2"
+  else
+    echo "FAIL $2"
+    failures=$((failures + 1))
+    [ -n "${3:-}" ] && printf '%s\n' "$3" | sed 's/^/       /'
+  fi
+}
+
+# check NAME STATUS PATTERN... -- PROBE-ARGUMENTS...
+# Runs the probe and wants this exit status and every pattern (a fixed
+# string) in its output.
+check() {
+  local name=$1 status=$2
+  shift 2
+  local patterns=()
+  while [ "$1" != -- ]; do
+    patterns+=("$1")
+    shift
+  done
+  shift
+  out=$("$probe" "$@" 2>&1)
+  local got=$? verdict=ok pattern
+  [ "$got" = "$status" ] || verdict="exit status $got, wanted $status"
+  for pattern in "${patterns[@]}"; do
+    grep -qF -- "$pattern" <<<"$out" || verdict="no \`$pattern\` in the output"
+  done
+  if [ "$verdict" = ok ]; then
+    report ok "$name"
+  else
+    report FAIL "$name" "$verdict"$'\n'"$out"
+  fi
+}
+
+# The last check's output must not hold this text.
+absent() {
+  if grep -qF -- "$2" <<<"$out"; then
+    report FAIL "$1" "$out"
+  else
+    report ok "$1"
+  fi
+}
+
+wait_for_port() {
+  for _ in $(seq 100); do
+    (exec 3<>"/dev/tcp/127.0.0.1/$1") 2>/dev/null && return 0
+    sleep 0.1
+  done
+  return 1
+}
+
+start_sshd() {
+  "$sshd" -D -e -f "$work/sshd_config" >>"$work/sshd.log" 2>&1 &
+  sshd_pid=$!
+  pids+=("$sshd_pid")
+  wait_for_port "$sshd_port"
+}
+
+echo "building examples/probe"
+if ! (cd "$root/examples/probe" && "$anvil" build >"$work/build.log" 2>&1); then
+  cat "$work/build.log"
+  echo "FAIL the probe does not build"
+  exit 1
+fi
+probe=$root/examples/probe/target/probe
+
+ssh-keygen -q -t ed25519 -N '' -f "$work/host_key"
+ssh-keygen -q -t ed25519 -N '' -f "$work/user_key"
+ssh-keygen -q -t ed25519 -N '' -f "$work/other_key"
+ssh-keygen -q -t ed25519 -N 'open sesame' -f "$work/locked_key"
+cat "$work/user_key.pub" "$work/locked_key.pub" >"$work/authorized_keys"
+known=$work/known_hosts
+
+sshd=$(command -v sshd || true)
+[ -n "$sshd" ] || for candidate in /usr/sbin/sshd /usr/bin/sshd; do
+  [ -x "$candidate" ] && sshd=$candidate
+done
+
+if [ -z "$sshd" ]; then
+  echo "skip the OpenSSH checks: no sshd on this machine"
+else
+  cat >"$work/sshd_config" <<END
+Port $sshd_port
+ListenAddress 127.0.0.1
+HostKey $work/host_key
+PidFile $work/sshd.pid
+AuthorizedKeysFile $work/authorized_keys
+UsePAM no
+StrictModes no
+PubkeyAuthentication yes
+PasswordAuthentication yes
+KbdInteractiveAuthentication no
+END
+  # The refused logins below would make a newer sshd (9.8) turn this
+  # address away for a while; an older one does not know the option.
+  echo "PerSourcePenalties no" >>"$work/sshd_config"
+  "$sshd" -t -f "$work/sshd_config" 2>/dev/null || sed -i.bak '/^PerSourcePenalties/d' "$work/sshd_config"
+  if ! start_sshd; then
+    cat "$work/sshd.log"
+    echo "FAIL sshd does not listen on port $sshd_port"
+    exit 1
+  fi
+  echo "OpenSSH: $("$sshd" -V 2>&1 | head -1) on port $sshd_port"
+  to="port=$sshd_port user=$user known_hosts=$known"
+  host_print=$(ssh-keygen -lf "$work/host_key.pub" | awk '{print $2}')
+  user_print=$(ssh-keygen -lf "$work/user_key.pub" | awk '{print $2}')
+
+  # The host key.
+  : >"$known"
+  check "Strict refuses a host an empty known_hosts does not name" 1 "error HostKeyUnknown:" "$host_print" \
+    -- connect $to policy=strict key="$work/user_key"
+  [ -s "$known" ] && report FAIL "Strict leaves known_hosts as it was" || report ok "Strict leaves known_hosts as it was"
+  check "AcceptNew lets an unknown host in" 0 "connected $host_print" \
+    -- connect $to policy=accept-new key="$work/user_key"
+  [ "$(wc -l <"$known")" = 1 ] && grep -qF "$(cut -d' ' -f2 "$work/host_key.pub")" "$known" \
+    && report ok "AcceptNew records the host's key" || report FAIL "AcceptNew records the host's key" "$(cat "$known")"
+  check "Strict accepts the recorded host" 0 "connected $host_print" \
+    -- connect $to policy=strict key="$work/user_key"
+  check "AcceptNew accepts the recorded host" 0 "connected $host_print" \
+    -- connect $to policy=accept-new key="$work/user_key"
+  [ "$(wc -l <"$known")" = 1 ] && report ok "and records it once" || report FAIL "and records it once" "$(cat "$known")"
+  check "a pinned fingerprint accepts its host" 0 "connected $host_print" \
+    -- connect $to policy=pin pin="$host_print" key="$work/user_key"
+  check "another pinned fingerprint refuses it" 1 "error HostKeyChanged:" "not the pinned $user_print" \
+    -- connect $to policy=pin pin="$user_print" key="$work/user_key"
+  check "a malformed fingerprint is a Config error" 1 "error Config:" \
+    -- connect $to policy=pin pin="SHA256:short" key="$work/user_key"
+
+  # Authentication.
+  check "a key the server does not know is refused" 1 "error Authentication:" "the key $work/other_key: refused" "the server accepts publickey, password" \
+    -- connect $to key="$work/other_key"
+  check "the second method is tried after the first" 0 "connected" \
+    -- connect $to key="$work/other_key" key="$work/user_key"
+  check "an encrypted key opens with its passphrase" 0 "connected" \
+    -- connect $to passphrase="open sesame" key="$work/locked_key"
+  check "an encrypted key without a passphrase fails without prompting" 1 "error Authentication:" "cannot be read" \
+    -- connect $to key="$work/locked_key"
+  check "an encrypted key with a wrong passphrase fails" 1 "error Authentication:" "cannot be read" \
+    -- connect $to passphrase="wrong-phrase-7" key="$work/locked_key"
+  absent "and the error does not show the passphrase" "wrong-phrase-7"
+  check "a wrong password is refused" 1 "error Authentication:" "the password: refused" \
+    -- connect $to password="wrong-word-7"
+  absent "and the error does not show the password" "wrong-word-7"
+  check "a missing key file is a Config error" 1 "error Config:" "does not exist" \
+    -- connect $to key="$work/no_such_key"
+  check "no method at all is a Config error" 1 "error Config:" \
+    -- connect $to
+  if command -v ssh-agent >/dev/null && command -v ssh-add >/dev/null; then
+    ssh-agent -D -a "$work/agent" >/dev/null 2>&1 &
+    pids+=("$!")
+    for _ in $(seq 50); do [ -S "$work/agent" ] && break; sleep 0.1; done
+    export SSH_AUTH_SOCK=$work/agent
+    check "an agent without keys is refused" 1 "error Authentication:" "the agent:" \
+      -- connect $to agent=
+    ssh-add -q "$work/user_key" 2>/dev/null
+    check "an agent holding the key is let in" 0 "connected" \
+      -- connect $to agent=
+    unset SSH_AUTH_SOCK
+    check "no agent is refused" 1 "error Authentication:" "the agent:" \
+      -- connect $to agent=
+  else
+    echo "skip the agent checks: no ssh-agent"
+  fi
+  check "a closed port is a Connect error" 1 "error Connect:" \
+    -- connect port=$((sshd_port + 99)) user="$user" known_hosts="$known" key="$work/user_key"
+
+  # Commands.
+  with_key="$to key=$work/user_key"
+  check "a command's output and status come back" 0 "status Code(7)" "sizes 4 4" "stdout out\\n" "stderr err\\n" \
+    -- run $with_key "command=echo out; echo err >&2; exit 7"
+  check "a command that is not there exits with 127" 0 "status Code(127)" \
+    -- run $with_key "command=/no/such/command"
+  check "a command killed by a signal says which" 0 "status Signal(TERM)" \
+    -- run $with_key 'command=kill -TERM $$'
+  size=$(seq 1 100000 | wc -c)
+  check "a large output arrives whole" 0 "status Code(0)" "sizes $size $size" \
+    -- run $with_key "command=seq 1 100000; seq 1 100000 >&2" max_output=2000000
+  check "output of exactly the cap passes" 0 "sizes 5 0" "stdout 12345" \
+    -- run $with_key "command=printf 12345" max_output=5
+  check "one byte more is TooLarge" 1 "error TooLarge:" \
+    -- run $with_key "command=printf 12345" max_output=4
+  check "an endless output is cut off" 1 "error TooLarge:" \
+    -- run $with_key "command=cat /dev/zero" max_output=100000 timeout_ms=20000
+  started=$(date +%s)
+  check "a command that outlasts its timeout is a Timeout" 1 "error Timeout:" \
+    -- run $with_key "command=sleep 5" timeout_ms=700
+  [ $(($(date +%s) - started)) -le 3 ] && report ok "and returns in time" || report FAIL "and returns in time"
+
+  # The shell.
+  check "a shell echoes input, follows a resize, and ends" 0 \
+    'ok expect MARK-$((40+2))' "ok expect MARK-42" "ok expect 24 80" "ok expect 30 100" "ended Code(3)" \
+    -- shell $with_key columns=80 rows=24 $'send=echo MARK-$((40+2))\n' 'expect=MARK-$((40+2))' expect=MARK-42 \
+    $'send=stty size\n' "expect=24 80" resize=100x30 $'send=stty size\n' "expect=30 100" $'send=exit 3\n' end=
+
+  # A new host key on the same address.
+  kill "$sshd_pid"
+  wait "$sshd_pid" 2>/dev/null
+  rm "$work/host_key" "$work/host_key.pub"
+  ssh-keygen -q -t ed25519 -N '' -f "$work/host_key"
+  before=$(cat "$known")
+  if start_sshd; then
+    check "Strict refuses a changed host key" 1 "error HostKeyChanged:" \
+      -- connect $to policy=strict key="$work/user_key"
+    check "AcceptNew refuses a changed host key" 1 "error HostKeyChanged:" \
+      -- connect $to policy=accept-new key="$work/user_key"
+    [ "$before" = "$(cat "$known")" ] && report ok "and known_hosts keeps the old key" || report FAIL "and known_hosts keeps the old key"
+  else
+    report FAIL "sshd restarts with a new host key" "$(tail -5 "$work/sshd.log")"
+  fi
+  kill "$sshd_pid"
+  wait "$sshd_pid" 2>/dev/null
+fi
+
+# The package against itself.
+"$probe" serve port="$self_port" host_key="$work/self_host_key" accept=ann:sesame >"$work/serve.log" 2>&1 &
+pids+=("$!")
+if ! wait_for_port "$self_port"; then
+  report FAIL "the probe's server listens on port $self_port" "$(cat "$work/serve.log")"
+else
+  echo "ssh.server on port $self_port"
+  self="port=$self_port known_hosts=$work/self_known"
+  check "the client records the server's new host key" 0 "connected SHA256:" \
+    -- connect $self user=bob policy=accept-new key="$work/user_key"
+  check "a key logs in, bytes go both ways, a resize arrives, the close is clean" 0 \
+    "ok expect hello bob Key(ssh-ed25519, $user_print)" "ok expect vt100 90x20" "ok expect typed" \
+    "ok expect resize 100x30" "ended Code(0)" \
+    -- shell $self user=bob key="$work/user_key" term=vt100 columns=90 rows=20 \
+    "expect=hello bob Key(ssh-ed25519, $user_print)" "expect=vt100 90x20" send=typed expect=typed \
+    resize=100x30 "expect=resize 100x30" send=q end=
+  check "a password the server's check accepts logs in" 0 "ok expect hello ann Password(ann)" "ended Code(0)" \
+    -- shell $self user=ann password=sesame "expect=hello ann Password(ann)" send=q end=
+  check "a password it refuses does not" 1 "error Authentication:" "the password: refused" \
+    -- connect $self user=ann password=sesame-7
+  absent "and the error does not show the password" "sesame-7"
+  check "the right password for another user does not" 1 "error Authentication:" \
+    -- connect $self user=bob password=sesame
+  check "the server refuses a command" 1 "error Channel:" \
+    -- run $self user=bob key="$work/user_key" command=id
+  if command -v ssh >/dev/null; then
+    out=$(printf q | ssh -tt -F /dev/null -p "$self_port" -i "$work/user_key" -o IdentitiesOnly=yes \
+      -o IdentityAgent=none -o UserKnownHostsFile="$work/openssh_known" -o StrictHostKeyChecking=accept-new \
+      -o LogLevel=ERROR bob@127.0.0.1 2>&1)
+    [ $? = 0 ] && grep -qF "hello bob Key(ssh-ed25519, $user_print)" <<<"$out" \
+      && report ok "OpenSSH's client gets the same server" || report FAIL "OpenSSH's client gets the same server" "$out"
+  fi
+fi
+
+echo "$((checks - failures)) of $checks checks passed"
+[ "$failures" = 0 ]
