@@ -1,0 +1,56 @@
+# `anvil ffi gen` writes `src/sys/` from the system libssh headers;
+# `anvil ffi gen --check` compares them.
+#
+# libssh adds and deprecates functions in every release, so the binding is
+# pinned to the API the safe layer uses: `ignore` drops every name and
+# `require` brings back exactly those below. A header that lacks one fails
+# `ffi gen` at that name. Using another function means adding it here.
+[generate]
+headers = ["libssh/libssh.h", "libssh/server.h", "libssh/callbacks.h"]
+include = ["/usr/include"]
+output = "src/sys"
+allow = "^(ssh_|SSH_|socket_t)"
+ignore = "."
+require = [
+  # Types.
+  "ssh_session", "ssh_channel", "ssh_bind", "ssh_event", "ssh_key", "ssh_message",
+  "ssh_server_callbacks_struct", "ssh_channel_callbacks_struct", "ssh_event_callback",
+  "ssh_bind_options_e", "ssh_options_e", "ssh_keytypes_e", "ssh_publickey_hash_type",
+  # Library.
+  "ssh_init", "ssh_finalize", "ssh_get_error",
+  # Listening.
+  "ssh_bind_new", "ssh_bind_free", "ssh_bind_options_set", "ssh_bind_listen",
+  "ssh_bind_get_fd", "ssh_bind_set_blocking", "ssh_bind_accept",
+  # Sessions.
+  "ssh_new", "ssh_free", "ssh_disconnect", "ssh_is_connected", "ssh_options_set", "ssh_get_fd",
+  "ssh_handle_key_exchange", "ssh_set_auth_methods", "ssh_set_server_callbacks",
+  "ssh_message_auth_interactive_request", "ssh_message_auth_kbdint_is_response",
+  "ssh_message_auth_user",
+  # Channels.
+  "ssh_channel_new", "ssh_channel_free", "ssh_channel_write", "ssh_channel_send_eof",
+  "ssh_channel_close", "ssh_channel_is_open", "ssh_channel_request_send_exit_status",
+  "ssh_set_channel_callbacks", "ssh_remove_channel_callbacks",
+  # The poll loop.
+  "ssh_event_new", "ssh_event_free", "ssh_event_add_session", "ssh_event_remove_session",
+  "ssh_event_add_fd", "ssh_event_remove_fd", "ssh_event_dopoll",
+  # Keys.
+  "ssh_pki_generate_key", "ssh_pki_ctx", "ssh_key_free", "ssh_key_type",
+  "ssh_key_type_to_char", "ssh_get_publickey_hash", "ssh_get_fingerprint_hash",
+  "ssh_clean_pubkey_hash", "ssh_string_free_char",
+]
+
+# `unsigned char **hash` and `ssh_key *pkey` are one value written by C.
+[arrays.ssh_get_publickey_hash]
+out = ["hash"]
+
+[arrays.ssh_clean_pubkey_hash]
+out = ["hash"]
+
+[arrays.ssh_pki_generate_key]
+out = ["pkey"]
+
+[arrays.ssh_get_fingerprint_hash]
+array = { hash = "len" }
+
+[arrays.ssh_message_auth_interactive_request]
+array = { prompts = "num_prompts" }

@@ -1,0 +1,316 @@
+// `ssh.server`: `serve`, an SSH server that hands each authenticated
+// connection with a shell to a handler as a `Session`.
+//
+// libssh does the protocol: key exchange, ciphers, authentication, and
+// the channel. Its calls block, so every connection is an actor pinned to
+// a thread of its own, and a slow client stalls nobody else.
+
+use std.actor.{ActorError, ActorSystem}
+use std.ffi.{CBuffer, CFn, CHandle, CStr, Out, Ptr}
+use std.fs.{Fs, Path}
+use std.ref.Ref
+use std.time.{Clock, Duration}
+use pkg.error.{HostKey, Listen, SshError, failure}
+use pkg.session.{
+  SSH_ERROR,
+  SSH_OK,
+  Session,
+  State,
+  on_auth_kbdint,
+  on_auth_pubkey,
+  on_channel_open,
+  on_close,
+  on_data,
+  on_env_request,
+  on_eof,
+  on_pty_request,
+  on_shell_request,
+  on_window_change
+}
+use pkg.sys.callbacks.{ssh_channel_callbacks_struct, ssh_server_callbacks_struct, ssh_set_server_callbacks}
+use pkg.sys.hand.{ssh_pki_export_privkey_file, umask}
+use pkg.sys.libssh.{
+  ssh_channel_close,
+  ssh_channel_is_open,
+  ssh_channel_send_eof,
+  ssh_disconnect,
+  ssh_event,
+  ssh_event_add_fd,
+  ssh_event_add_session,
+  ssh_event_dopoll,
+  ssh_event_free,
+  ssh_event_new,
+  ssh_event_remove_session,
+  ssh_free,
+  ssh_get_error,
+  ssh_init,
+  ssh_is_connected,
+  ssh_key,
+  ssh_key_free,
+  ssh_keytypes_e,
+  ssh_new,
+  ssh_pki_generate_key,
+  ssh_session
+}
+use pkg.sys.server.{
+  ssh_bind,
+  ssh_bind_accept,
+  ssh_bind_free,
+  ssh_bind_get_fd,
+  ssh_bind_listen,
+  ssh_bind_new,
+  ssh_bind_options_e,
+  ssh_bind_options_set,
+  ssh_channel_request_send_exit_status,
+  ssh_handle_key_exchange,
+  ssh_set_auth_methods
+}
+
+const SSH_AGAIN: i32 = -2i32
+const SSH_AUTH_METHOD_PUBLICKEY: i32 = 4i32
+const SSH_AUTH_METHOD_INTERACTIVE: i32 = 16i32
+const POLLIN: i16 = 1i16
+// How long a client has to end the connection after its channel closed.
+const CLOSE_TIMEOUT: Duration = Duration.seconds(2)
+// Polls of the listening socket that may fail in a row before `serve`
+// gives up.
+const MAX_LISTENER_FAILURES: Int = 100
+// `sizeof` of the callback structs, which libssh reads to learn which
+// fields the caller knows; the generated `#[c_layout]` checks hold the
+// same numbers.
+const SERVER_CALLBACKS_SIZE: usize = 104usize
+const CHANNEL_CALLBACKS_SIZE: usize = 152usize
+
+/// How `serve` listens and whom it lets in.
+pub struct Config {
+  /// The address to bind, such as `127.0.0.1` or `0.0.0.0`.
+  pub address: String,
+  pub port: Int,
+  /// The file of the server's Ed25519 host key, created with mode 0600 on
+  /// the first run.
+  pub host_key: Path,
+  /// Connections served at once; one more is dropped as it arrives.
+  pub max_connections: Int,
+  /// Whether a client without a key comes in as `Identity.Guest`.
+  pub allow_guests: Bool,
+  /// How long a client has to authenticate and ask for a shell.
+  pub login_timeout: Duration,
+}
+
+/// What `serve` runs for each session, on the connection's own thread. The
+/// connection closes when it returns.
+pub type Handler = dyn Callable[(mut Session), Unit] + send
+
+#[foreign_resource(close = ssh_bind_free)]
+struct Bind {
+  ptr: ssh_bind
+}
+
+#[foreign_resource(close = ssh_event_free)]
+struct EventLoop {
+  ptr: ssh_event
+}
+
+// A connection accepted on the listening thread and served on its own.
+// libssh lets a session move between threads while none uses it.
+#[foreign_resource(close = ssh_free, send)]
+struct RawSession {
+  ptr: ssh_session
+}
+
+type ConnectionMsg: send =
+  | Start(raw: RawSession)
+
+actor Connection(clock: Clock, allow_guests: Bool, login_timeout: Duration, handler: Handler, slots: Receiver[Unit]) receives ConnectionMsg {
+  on Start(raw) {
+    run(clock, allow_guests, login_timeout, handler, raw)
+    // Gives back the slot `serve` took for this connection.
+    slots.receive()?
+    exit
+  }
+}
+
+/// Listens as `config` says and serves connections until the scope of
+/// `actors` is cancelled, calling `handler` for each session. It blocks its
+/// thread; call it from `main`.
+pub fn serve(actors: ActorSystem, clock: Clock, fs: Fs, config: Config, handler: Handler) -> Result[Unit, SshError] {
+  if ssh_init() != SSH_OK {
+    return Err(failure(Listen, "libssh failed to initialize"))
+  }
+  ensure_host_key(fs, config.host_key)?
+  with bind = listen(config)? {
+    with ready = event_loop() {
+      if ssh_event_add_fd(ready.ptr, ssh_bind_get_fd(bind.ptr), POLLIN, CFn.from(on_listener_ready), Ptr.null()) != SSH_OK {
+        return Err(failure(Listen, "cannot poll the listening socket"))
+      }
+      accept_loop(actors, clock, config, handler, bind, ready)?
+      return Err(failure(Listen, "the listening socket failed"))
+    }
+  }
+}
+
+// Accepts connections until the scope is cancelled, one pinned actor each.
+fn accept_loop(actors: ActorSystem, clock: Clock, config: Config, handler: Handler, bind: Bind, ready: EventLoop) -> Result[Unit, ActorError] {
+  with scope = actors.scope()? {
+    // One value per live connection: a full channel is a full server.
+    let slots: Channel[Unit] = actors.channel(capacity: config.max_connections.max(1))?
+    var failures = 0
+    while failures < MAX_LISTENER_FAILURES {
+      let outcome = ssh_event_dopoll(ready.ptr, 250i32)
+      if outcome == SSH_AGAIN {
+        continue
+      }
+      if outcome == SSH_ERROR {
+        failures += 1
+        clock.sleep(Duration.milliseconds(50))
+        continue
+      }
+      failures = 0
+      let raw = RawSession { ptr: ssh_new() }
+      if raw.ptr.is_null() || ssh_bind_accept(bind.ptr, raw.ptr) != SSH_OK {
+        continue
+      }
+      if slots.sender.try_send(Unit).is_err() {
+        ssh_disconnect(raw.ptr)
+        continue
+      }
+      let connection = scope.spawn_pinned(Connection(clock, config.allow_guests, config.login_timeout, handler, slots.receiver))?
+      connection.send(Start(move raw))?
+    }
+  }
+  return Ok(Unit)
+}
+
+fn event_loop() -> EventLoop {
+  return EventLoop { ptr: ssh_event_new() }
+}
+
+// The poll loop only needs to wake up; `serve` accepts after it returns.
+fn on_listener_ready(_fd: i32, _events: i32, _data: Ptr[Unit]) -> i32 {
+  return 0i32
+}
+
+fn last_error(bind: ssh_bind) -> String {
+  return String.from_c(ssh_get_error(bind.cast[Unit]())).unwrap_or("<not UTF-8>")
+}
+
+fn set_text(bind: Bind, option: ssh_bind_options_e, text: String) -> Bool {
+  with value = CStr.from(text) {
+    return ssh_bind_options_set(bind.ptr, option, value.ptr().cast[Unit]()) == SSH_OK
+  }
+}
+
+fn listen(config: Config) -> Result[Bind, SshError] {
+  let bind = Bind { ptr: ssh_bind_new() }
+  if bind.ptr.is_null() {
+    return Err(failure(Listen, "out of memory"))
+  }
+  var port = CBuffer[u32].new(1)
+  port[0] = config.port.try_to_u32().unwrap_or(0u32)
+  if !set_text(bind, ssh_bind_options_e.Bindaddr, config.address) {
+    return Err(failure(Listen, last_error(bind.ptr)))
+  }
+  if ssh_bind_options_set(bind.ptr, ssh_bind_options_e.Bindport, port.ptr().cast[Unit]()) != SSH_OK {
+    return Err(failure(Listen, last_error(bind.ptr)))
+  }
+  if !set_text(bind, ssh_bind_options_e.Hostkey, "{config.host_key}") {
+    return Err(failure(HostKey, last_error(bind.ptr)))
+  }
+  if ssh_bind_listen(bind.ptr) != SSH_OK {
+    return Err(failure(Listen, last_error(bind.ptr)))
+  }
+  return Ok(move bind)
+}
+
+// Writes a new Ed25519 host key to `path` unless the file exists. The
+// umask keeps the file private from the moment libssh creates it.
+fn ensure_host_key(fs: Fs, path: Path) -> Result[Unit, SshError] {
+  if fs.exists(path) {
+    return Ok(Unit)
+  }
+  let out = Out[ssh_key].new()
+  if ssh_pki_generate_key(ssh_keytypes_e.Ed25519, Ptr.null(), out) != SSH_OK {
+    return Err(failure(HostKey, "cannot generate an Ed25519 key"))
+  }
+  let key = out.get()
+  let mask = umask(63u32)
+  let outcome = ssh_pki_export_privkey_file(key, Ptr.null(), Ptr.null(), Ptr.null(), "{path}")
+  umask(mask)
+  ssh_key_free(key)
+  if outcome != SSH_OK {
+    return Err(failure(HostKey, "cannot write {path}"))
+  }
+  return Ok(Unit)
+}
+
+// Serves one connection: key exchange, authentication, then the handler.
+fn run(clock: Clock, allow_guests: Bool, login_timeout: Duration, handler: Handler, raw: RawSession) -> Unit {
+  let state = Ref.new(State.new(allow_guests))
+  with handle = CHandle.new(state) {
+    var channel_callbacks = ssh_channel_callbacks_struct.zeroed()
+    channel_callbacks.size = CHANNEL_CALLBACKS_SIZE
+    channel_callbacks.userdata = handle.ptr()
+    channel_callbacks.channel_data_function = CFn.from(on_data)
+    channel_callbacks.channel_eof_function = CFn.from(on_eof)
+    channel_callbacks.channel_close_function = CFn.from(on_close)
+    channel_callbacks.channel_pty_request_function = CFn.from(on_pty_request)
+    channel_callbacks.channel_shell_request_function = CFn.from(on_shell_request)
+    channel_callbacks.channel_pty_window_change_function = CFn.from(on_window_change)
+    channel_callbacks.channel_env_request_function = CFn.from(on_env_request)
+    state.value.set_channel_callbacks(channel_callbacks.ptr().address())
+
+    var server_callbacks = ssh_server_callbacks_struct.zeroed()
+    server_callbacks.size = SERVER_CALLBACKS_SIZE
+    server_callbacks.userdata = handle.ptr()
+    server_callbacks.auth_pubkey_function = CFn.from(on_auth_pubkey)
+    server_callbacks.auth_kbdint_function = CFn.from(on_auth_kbdint)
+    server_callbacks.channel_open_request_session_function = CFn.from(on_channel_open)
+
+    var methods = SSH_AUTH_METHOD_PUBLICKEY
+    if allow_guests {
+      methods = methods | SSH_AUTH_METHOD_INTERACTIVE
+    }
+    ssh_set_auth_methods(raw.ptr, methods)
+    if ssh_set_server_callbacks(raw.ptr, server_callbacks.ptr()) != SSH_OK {
+      return
+    }
+    if ssh_handle_key_exchange(raw.ptr) != SSH_OK {
+      return
+    }
+    with events = event_loop() {
+      if ssh_event_add_session(events.ptr, raw.ptr) != SSH_OK {
+        return
+      }
+      let started = clock.now()
+      var alive = true
+      while alive && !state.value.ready() {
+        if ssh_event_dopoll(events.ptr, 100i32) == SSH_ERROR && ssh_is_connected(raw.ptr) == 0i32 {
+          alive = false
+        }
+        if clock.since(started) > login_timeout {
+          alive = false
+        }
+      }
+      if alive {
+        var session = Session.new(events.ptr, raw.ptr, state)
+        handler(mut session)
+        let channel = state.value.channel()
+        if !channel.is_null() && ssh_channel_is_open(channel) != 0i32 {
+          ssh_channel_request_send_exit_status(channel, 0i32)
+          ssh_channel_send_eof(channel)
+          ssh_channel_close(channel)
+          // The client ends the connection once it has the exit status;
+          // disconnecting first would show it an error.
+          let closing = clock.now()
+          while ssh_is_connected(raw.ptr) != 0i32 && clock.since(closing) < CLOSE_TIMEOUT {
+            if ssh_event_dopoll(events.ptr, 50i32) == SSH_ERROR {
+              break
+            }
+          }
+        }
+      }
+      ssh_disconnect(raw.ptr)
+      ssh_event_remove_session(events.ptr, raw.ptr)
+    }
+  }
+}

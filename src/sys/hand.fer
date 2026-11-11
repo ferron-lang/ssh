@@ -1,0 +1,22 @@
+// Hand-written externs beside the generated modules: libssh functions
+// whose generated parameter types cannot say what the safe layer passes,
+// and the one libc call it needs.
+
+use std.ffi.{CStr, Ptr}
+use pkg.sys.libssh.ssh_key
+
+extern "C" {
+  // The generated signature takes `passphrase: CStr`, which cannot be the
+  // NULL that asks for an unencrypted file, and an `auth_fn` callback that
+  // is unused without a passphrase.
+  pub fn ssh_pki_export_privkey_file(
+    privkey: ssh_key,
+    passphrase: Ptr[u8],
+    auth_fn: Ptr[Unit],
+    auth_data: Ptr[Unit],
+    filename: CStr
+  ) -> i32
+
+  // libc: the file mode creation mask of the process.
+  pub fn umask(mask: u32) -> u32
+}

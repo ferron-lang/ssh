@@ -1,0 +1,9 @@
+[package]
+name = "ssh"
+version = "0.1.0"
+ferron = ">=0.10.0-alpha.2"
+license = "MIT"
+ffi = true
+
+[native]
+link = ["ssh"]

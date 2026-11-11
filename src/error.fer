@@ -1,0 +1,48 @@
+// `ssh.error`: `SshError`, the failure every fallible call returns.
+
+use std.actor.ActorError
+use std.error.Error
+
+/// Why an SSH operation failed.
+#[derive(Eq, Hash)]
+pub type SshErrorKind =
+  /// The host key could not be generated, written, or loaded.
+  | HostKey
+  /// The address could not be bound or listened on.
+  | Listen
+  /// The connection is closed.
+  | Closed
+  /// The actor runtime failed (a closed channel, a cancelled scope).
+  | Actor
+
+/// A failed SSH operation: its kind and libssh's message.
+#[derive(Eq)]
+pub struct SshError {
+  pub kind: SshErrorKind,
+  pub message: String,
+}
+
+impl Error for SshError {
+}
+
+impl Display for SshError {
+  /// `<kind>: <message>`, such as `Listen: Address already in use`.
+  fn to_string(self) -> String {
+    return "{self.kind}: {self.message}"
+  }
+}
+
+impl FromError[ActorError] for SshError {
+  fn from_error(error: ActorError) -> SshError {
+    return SshError { kind: Actor, message: "{error}" }
+  }
+}
+
+pub(pkg) fn failure(kind: SshErrorKind, message: String) -> SshError {
+  return SshError { kind: kind, message: message }
+}
+
+#[test("an error displays its kind and message")]
+fn error_displays_kind_and_message() -> Unit {
+  expect.equal("{failure(Listen, "address in use")}", "Listen: address in use")
+}

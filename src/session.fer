@@ -1,0 +1,373 @@
+// `ssh.session`: `Session`, one authenticated connection with a terminal:
+// who the client is, its terminal type and size, the bytes it types, and
+// the bytes written back to it.
+//
+// A session lives on the thread of its connection (libssh keeps a session
+// to one thread), so it is lent to the handler `ssh.server.serve` calls
+// and never leaves it.
+
+use std.bytes.Bytes
+use std.collections.Map
+use std.ffi.{CBuffer, CHandle, Out, Ptr}
+use std.ref.Ref
+use std.time.Duration
+use pkg.error.{SshError, SshErrorKind, failure}
+use pkg.sys.callbacks.ssh_channel_callbacks_struct
+use pkg.sys.libssh.{
+  ssh_channel,
+  ssh_channel_is_open,
+  ssh_channel_new,
+  ssh_channel_write,
+  ssh_clean_pubkey_hash,
+  ssh_event,
+  ssh_event_dopoll,
+  ssh_get_fingerprint_hash,
+  ssh_get_publickey_hash,
+  ssh_is_connected,
+  ssh_key,
+  ssh_key_struct,
+  ssh_key_type,
+  ssh_key_type_to_char,
+  ssh_message,
+  ssh_publickey_hash_type,
+  ssh_session,
+  ssh_string_free_char
+}
+use pkg.sys.callbacks.ssh_set_channel_callbacks
+use pkg.sys.server.{ssh_message_auth_interactive_request, ssh_message_auth_kbdint_is_response, ssh_message_auth_user}
+
+pub(pkg) const SSH_OK: i32 = 0i32
+pub(pkg) const SSH_ERROR: i32 = -1i32
+pub(pkg) const SSH_AUTH_SUCCESS: i32 = 0i32
+pub(pkg) const SSH_AUTH_DENIED: i32 = 1i32
+pub(pkg) const SSH_AUTH_INFO: i32 = 3i32
+const SSH_PUBLICKEY_STATE_NONE: i8 = 0i8
+const SSH_PUBLICKEY_STATE_VALID: i8 = 1i8
+
+// The longest terminal type and the most environment variables a client
+// may set; the rest is dropped.
+const MAX_TERM_LENGTH: Int = 64
+const MAX_ENV_VARIABLES: Int = 32
+const MAX_ENV_LENGTH: Int = 256
+// The largest window a client may report.
+const MAX_WINDOW: Int = 1000
+
+/// Who the client is.
+#[derive(Eq, Hash)]
+pub type Identity =
+  /// It proved it holds the private key of this public key. `fingerprint`
+  /// is OpenSSH's form, `SHA256:<base64>`, and names the same key on every
+  /// connection.
+  | Key(algorithm: String, fingerprint: String)
+  /// It has no key and came in through `keyboard-interactive`.
+  | Guest
+
+/// What a client sent since the last `Session.poll`.
+#[derive(Eq)]
+pub type Input =
+  /// Bytes it typed: feed them to a `std.term.Decoder`.
+  | Data(bytes: Bytes)
+  /// Its window is now `columns` by `rows` cells.
+  | Resize(columns: Int, rows: Int)
+  /// It closed the channel or the connection dropped. It is the last
+  /// input, and every later `poll` returns it again.
+  | Closed
+
+// What the libssh callbacks of one connection read and change.
+pub(pkg) struct State {
+  allow_guests: Bool,
+  // The address of the connection's `ssh_channel_callbacks_struct`.
+  channel_callbacks: usize,
+  user: String,
+  identity: Option[Identity],
+  channel: ssh_channel,
+  shell: Bool,
+  term: String,
+  columns: Int,
+  rows: Int,
+  variables: Map[String, String],
+  inbox: List[Input],
+  closed: Bool,
+}
+
+impl State {
+  pub(pkg) fn new(allow_guests: Bool) -> State {
+    return State {
+      allow_guests: allow_guests,
+      channel_callbacks: 0usize,
+      user: "",
+      identity: None,
+      channel: Ptr.null(),
+      shell: false,
+      term: "dumb",
+      columns: 80,
+      rows: 24,
+      variables: Map.new(),
+      inbox: [],
+      closed: false,
+    }
+  }
+
+  /// Whether the client is authenticated and asked for a shell.
+  pub(pkg) fn ready(self) -> Bool {
+    return self.identity.is_some() && self.shell
+  }
+
+  pub(pkg) fn set_channel_callbacks(mut self, address: usize) -> Unit {
+    self.channel_callbacks = address
+  }
+
+  pub(pkg) fn channel(self) -> ssh_channel {
+    return self.channel
+  }
+}
+
+/// One authenticated connection with a shell channel.
+pub struct Session {
+  event: ssh_event,
+  session: ssh_session,
+  state: Ref[State],
+}
+
+impl Session {
+  pub(pkg) fn new(event: ssh_event, session: ssh_session, state: Ref[State]) -> Session {
+    return Session { event: event, session: session, state: state }
+  }
+
+  /// The user name the client logged in with. Anyone may claim any name:
+  /// `identity` is what tells clients apart.
+  pub fn user(self) -> String {
+    return self.state.value.user
+  }
+
+  pub fn identity(self) -> Identity {
+    return self.state.value.identity.unwrap_or(Guest)
+  }
+
+  /// The client's `TERM`, or `dumb` when it asked for no terminal.
+  pub fn term(self) -> String {
+    return self.state.value.term
+  }
+
+  /// The window in cells, `(columns, rows)`, as last reported.
+  pub fn size(self) -> Tuple[Int, Int] {
+    return (self.state.value.columns, self.state.value.rows)
+  }
+
+  /// An environment variable the client sent (`COLORTERM`, `LANG`), when
+  /// its `SendEnv` names it.
+  pub fn variable(self, name: String) -> Option[String] {
+    return self.state.value.variables.get(name)
+  }
+
+  /// Waits at most `timeout` for the client and returns what it sent,
+  /// oldest first; an empty list when nothing came.
+  pub fn poll(mut self, timeout: Duration) -> List[Input] {
+    if self.state.value.inbox.is_empty() && !self.state.value.closed {
+      let wait = timeout.as_milliseconds().clamp(0, 60000).try_to_i32().unwrap_or(0i32)
+      let outcome = ssh_event_dopoll(self.event, wait)
+      if outcome == SSH_ERROR && !self.is_open() {
+        self.state.value.closed = true
+      }
+    }
+    var inputs = self.state.value.inbox
+    self.state.value.inbox = []
+    if self.state.value.closed || !self.is_open() {
+      self.state.value.closed = true
+      inputs.push(Closed)
+    }
+    return inputs
+  }
+
+  /// Sends `bytes` to the client's terminal. It waits while the client's
+  /// window is full, and fails once the connection is closed.
+  pub fn write(mut self, bytes: Bytes) -> Result[Unit, SshError] {
+    if bytes.is_empty() {
+      return Ok(Unit)
+    }
+    if self.state.value.closed || !self.is_open() {
+      return Err(failure(SshErrorKind.Closed, "the connection is closed"))
+    }
+    var buffer = CBuffer.from(bytes.to_list())
+    let length = bytes.len().try_to_u32().expect_ok("a frame is smaller than 4 GiB")
+    let written = ssh_channel_write(self.state.value.channel, buffer.ptr().cast[Unit](), length)
+    if written < 0i32 {
+      self.state.value.closed = true
+      return Err(failure(SshErrorKind.Closed, "the connection is closed"))
+    }
+    return Ok(Unit)
+  }
+
+  fn is_open(self) -> Bool {
+    let channel = self.state.value.channel
+    return ssh_is_connected(self.session) != 0i32 && !channel.is_null() && ssh_channel_is_open(channel) != 0i32
+  }
+}
+
+// OpenSSH's `SHA256:<base64>` fingerprint of `key`.
+fn fingerprint(key: ssh_key) -> Option[String] {
+  let hash = Out[Ptr[u8]].new()
+  let length = Out[usize].new()
+  if ssh_get_publickey_hash(key, ssh_publickey_hash_type.Sha256, hash, length) != SSH_OK {
+    return None
+  }
+  let digest = Bytes.from_c_len(hash.get(), length.get())
+  ssh_clean_pubkey_hash(hash)
+  let text = ssh_get_fingerprint_hash(ssh_publickey_hash_type.Sha256, digest.to_list(), length.get())
+  if text.is_null() {
+    return None
+  }
+  let result = String.from_c(text)
+  ssh_string_free_char(text)
+  return result.ok()
+}
+
+// `publickey`: any key is accepted, and proving it is what identifies the
+// client. libssh asks twice: whether the key would be acceptable, then
+// with the verified signature.
+pub(pkg) fn on_auth_pubkey(_session: ssh_session, user: String, key: Ptr[ssh_key_struct], signature: i8, data: Ptr[Unit]) -> i32 {
+  if signature == SSH_PUBLICKEY_STATE_NONE {
+    return SSH_AUTH_SUCCESS
+  }
+  if signature != SSH_PUBLICKEY_STATE_VALID {
+    return SSH_AUTH_DENIED
+  }
+  match fingerprint(key) {
+    Some(print) => {
+      let state = CHandle[State].get(data)
+      let algorithm = String.from_c(ssh_key_type_to_char(ssh_key_type(key))).unwrap_or("unknown")
+      state.value.user = user
+      state.value.identity = Some(Key(algorithm, print))
+      return SSH_AUTH_SUCCESS
+    }
+    None => return SSH_AUTH_DENIED
+  }
+}
+
+// `keyboard-interactive` with no prompts: a client without a key comes in
+// as a guest without typing anything.
+pub(pkg) fn on_auth_kbdint(message: ssh_message, _session: ssh_session, data: Ptr[Unit]) -> i32 {
+  let state = CHandle[State].get(data)
+  if !state.value.allow_guests {
+    return SSH_AUTH_DENIED
+  }
+  if ssh_message_auth_kbdint_is_response(message) != 0i32 {
+    state.value.identity = Some(Guest)
+    return SSH_AUTH_SUCCESS
+  }
+  // Only the request names the user; the response does not.
+  let user = ssh_message_auth_user(message)
+  if !user.is_null() {
+    state.value.user = String.from_c(user).unwrap_or("")
+  }
+  let prompts: List[Ptr[u8]] = []
+  if ssh_message_auth_interactive_request(message, "", "", 0u32, prompts, Ptr.null()) != SSH_OK {
+    return SSH_AUTH_DENIED
+  }
+  return SSH_AUTH_INFO
+}
+
+// One `session` channel per connection; a second open is refused.
+pub(pkg) fn on_channel_open(session: ssh_session, data: Ptr[Unit]) -> ssh_channel {
+  let state = CHandle[State].get(data)
+  if state.value.identity.is_none() || !state.value.channel.is_null() {
+    return Ptr.null()
+  }
+  let channel = ssh_channel_new(session)
+  if channel.is_null() {
+    return channel
+  }
+  let callbacks = Ptr[ssh_channel_callbacks_struct].from_address(state.value.channel_callbacks)
+  if ssh_set_channel_callbacks(channel, callbacks) != SSH_OK {
+    return Ptr.null()
+  }
+  state.value.channel = channel
+  return channel
+}
+
+// A window dimension in cells; a client without a real terminal reports 0.
+fn window(cells: i32, fallback: Int) -> Int {
+  if cells <= 0i32 {
+    return fallback
+  }
+  return Int.from(cells).min(MAX_WINDOW)
+}
+
+pub(pkg) fn on_pty_request(
+  _session: ssh_session,
+  _channel: ssh_channel,
+  term: String,
+  columns: i32,
+  rows: i32,
+  _pixel_width: i32,
+  _pixel_height: i32,
+  data: Ptr[Unit]
+) -> i32 {
+  let state = CHandle[State].get(data)
+  if term.len() <= MAX_TERM_LENGTH {
+    state.value.term = term
+  }
+  state.value.columns = window(columns, 80)
+  state.value.rows = window(rows, 24)
+  return 0i32
+}
+
+pub(pkg) fn on_window_change(
+  _session: ssh_session,
+  _channel: ssh_channel,
+  columns: i32,
+  rows: i32,
+  _pixel_width: i32,
+  _pixel_height: i32,
+  data: Ptr[Unit]
+) -> i32 {
+  let state = CHandle[State].get(data)
+  state.value.columns = window(columns, 80)
+  state.value.rows = window(rows, 24)
+  state.value.inbox.push(Resize(state.value.columns, state.value.rows))
+  return 0i32
+}
+
+pub(pkg) fn on_env_request(_session: ssh_session, _channel: ssh_channel, name: String, value: String, data: Ptr[Unit]) -> i32 {
+  let state = CHandle[State].get(data)
+  if state.value.variables.len() >= MAX_ENV_VARIABLES || name.len() > MAX_ENV_LENGTH || value.len() > MAX_ENV_LENGTH {
+    return 1i32
+  }
+  state.value.variables.insert(name, value)
+  return 0i32
+}
+
+pub(pkg) fn on_shell_request(_session: ssh_session, _channel: ssh_channel, data: Ptr[Unit]) -> i32 {
+  let state = CHandle[State].get(data)
+  if state.value.shell {
+    return 1i32
+  }
+  state.value.shell = true
+  return 0i32
+}
+
+// The client's keys. Returning `length` tells libssh they are all taken,
+// which is what moves the channel's window.
+pub(pkg) fn on_data(
+  _session: ssh_session,
+  _channel: ssh_channel,
+  bytes: Ptr[Unit],
+  length: u32,
+  is_stderr: i32,
+  data: Ptr[Unit]
+) -> i32 {
+  let state = CHandle[State].get(data)
+  let count = Int.from(length).try_to_usize().unwrap_or(0usize)
+  if state.value.shell && is_stderr == 0i32 && count > 0usize {
+    state.value.inbox.push(Data(Bytes.from_c_len(bytes.cast[u8](), count)))
+  }
+  return length.try_to_i32().unwrap_or(0i32)
+}
+
+pub(pkg) fn on_eof(_session: ssh_session, _channel: ssh_channel, data: Ptr[Unit]) -> Unit {
+  CHandle[State].get(data).value.closed = true
+}
+
+pub(pkg) fn on_close(_session: ssh_session, _channel: ssh_channel, data: Ptr[Unit]) -> Unit {
+  CHandle[State].get(data).value.closed = true
+}
