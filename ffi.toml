@@ -4,7 +4,11 @@
 # libssh adds and deprecates functions in every release, so the binding is
 # pinned to the API the safe layer uses: `ignore` drops every name and
 # `require` brings back exactly those below. A header that lacks one fails
-# `ffi gen` at that name. Using another function means adding it here.
+# `ffi gen` at that name; the output is the same for the 0.12.0 and 0.12.2
+# headers. libssh 0.11 lacks `ssh_pki_generate_key` and `ssh_pki_ctx`, and
+# 0.10 also `ssh_channel_get_exit_state`; their enums and callback structs
+# are shorter too, so neither generates this binding. Using another
+# function means adding it here.
 [generate]
 headers = ["libssh/libssh.h", "libssh/server.h", "libssh/callbacks.h"]
 include = ["/usr/include"]

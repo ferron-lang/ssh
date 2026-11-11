@@ -111,6 +111,7 @@ pub struct Secret {
 }
 
 impl Secret {
+  /// Wraps `text`, a password or a passphrase.
   pub fn new(text: String) -> Secret {
     return Secret { text: text }
   }
@@ -145,6 +146,7 @@ pub type Auth =
   /// The keys of the SSH agent named by the `SSH_AUTH_SOCK` environment
   /// variable.
   | Agent
+  /// The user's password on the server.
   | Password(password: Secret)
 
 /// Where `connect` connects and how.
@@ -195,6 +197,7 @@ pub type Event =
   /// Bytes for the terminal. With a terminal the server sends everything
   /// here.
   | Stdout(bytes: Bytes)
+  /// Bytes of its standard error, when it runs without a terminal.
   | Stderr(bytes: Bytes)
   /// The shell ended. It is the last event, and every later `poll`
   /// returns it again.
@@ -281,7 +284,9 @@ impl Client {
   /// when the command runs longer than `timeout`, and with `TooLarge`
   /// when it writes more than `max_output` bytes to standard output and
   /// standard error together; the channel is then closed, and whether the
-  /// command goes on running is up to the server.
+  /// command goes on running is up to the server. Once the output has
+  /// ended, the wait for the exit status is bounded by the connection's
+  /// timeout, not by `timeout`.
   pub fn run(self, command: String, timeout: Duration, max_output: Int) -> Result[CommandOutput, SshError] {
     if command.is_empty() || !is_plain(command) {
       return Err(failure(Config, "the command is empty or holds a NUL"))
@@ -783,8 +788,18 @@ fn denied(user: String, attempts: List[String], offered: String) -> SshError {
 fn authenticate(session: ssh_session, clock: Clock, config: ClientConfig) -> Result[Unit, SshError] {
   let started = clock.now()
   // The `none` request is what makes the server list its methods.
-  if ssh_userauth_none(session, config.user) == SSH_AUTH_SUCCESS {
+  let first = ssh_userauth_none(session, config.user)
+  if first == SSH_AUTH_SUCCESS {
     return Ok(Unit)
+  }
+  if first != SSH_AUTH_DENIED && first != SSH_AUTH_PARTIAL {
+    let reason = session_error(session)
+    if timed_out(clock.since(started), config.timeout, reason) {
+      return Err(failure(Timeout, "the server did not answer the login of {config.user} in {config.timeout}"))
+    }
+    if ssh_is_connected(session) == 0i32 {
+      return Err(failure(SshErrorKind.Closed, "the server closed the connection before the login: {reason}"))
+    }
   }
   var attempts: List[String] = []
   for method in config.auth {
