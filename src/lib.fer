@@ -1,12 +1,19 @@
-// `ssh`: an SSH server for terminal programs, through the system `libssh`.
+// `ssh`: SSH for Ferron programs, both sides, through the system `libssh`.
 //
 // - `ssh.server`: `serve` listens and calls a handler for each
 //   authenticated connection with a shell; `Config` says where it listens
 //   and whom it lets in.
 // - `ssh.session`: `Session`, what the handler gets: the client's
-//   `Identity` (its public key's fingerprint, or `Guest`), its terminal
-//   type and window size, `poll` for what it typed (`Input`), and `write`.
+//   `Identity` (its public key's fingerprint, its password login, or
+//   `Guest`), its terminal type and window size, `poll` for what it typed
+//   (`Input`), and `write`.
+// - `ssh.client`: `connect` checks the server's host key (`HostKeyPolicy`)
+//   and authenticates (`Auth`); the `Client` runs commands (`run`) and
+//   drives a shell on a terminal (`shell`, `Shell`, `Event`).
 // - `ssh.error`: `SshError` and `SshErrorKind`.
 //
-// `pkg.sys` holds the generated `extern "C"` modules (`anvil ffi gen`) and
-// the hand-written `pkg.sys.hand`; they stay inside this package.
+// `pkg.common` holds what both sides share. `pkg.sys` holds the generated
+// `extern "C"` modules (`anvil ffi gen`) and the hand-written
+// `pkg.sys.hand`; they stay inside this package. Each module holds its own
+// tests; what needs a real server on the other end is in
+// `scripts/interop`.
