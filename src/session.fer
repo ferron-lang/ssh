@@ -59,6 +59,8 @@ pub type Identity =
   /// is OpenSSH's form, `SHA256:<base64>`, and names the same key on every
   /// connection.
   | Key(algorithm: String, fingerprint: String)
+  /// It gave a user name and a password that `Config.password` accepted.
+  | Password(user: String)
   /// It has no key and came in through `keyboard-interactive`.
   | Guest
 
@@ -73,9 +75,19 @@ pub type Input =
   /// input, and every later `poll` returns it again.
   | Closed
 
+/// Decides whether a user name and a password are let in. It runs on the
+/// connection's thread while the client waits, and may take its time (a
+/// slow password hash); it must not log the password.
+pub type PasswordCheck = dyn Callable[(String, String), Bool] + send
+
+// Passwords a connection may try before every further one is refused.
+const MAX_PASSWORD_ATTEMPTS: Int = 3
+
 // What the libssh callbacks of one connection read and change.
 pub(pkg) struct State {
   allow_guests: Bool,
+  password: Option[PasswordCheck],
+  password_attempts: Int,
   // The address of the connection's `ssh_channel_callbacks_struct`.
   channel_callbacks: usize,
   user: String,
@@ -91,9 +103,11 @@ pub(pkg) struct State {
 }
 
 impl State {
-  pub(pkg) fn new(allow_guests: Bool) -> State {
+  pub(pkg) fn new(allow_guests: Bool, password: Option[PasswordCheck]) -> State {
     return State {
       allow_guests: allow_guests,
+      password: password,
+      password_attempts: 0,
       channel_callbacks: 0usize,
       user: "",
       identity: None,
@@ -239,6 +253,29 @@ pub(pkg) fn on_auth_pubkey(_session: ssh_session, user: String, key: Ptr[ssh_key
       state.value.user = user
       state.value.identity = Some(Key(algorithm, print))
       return SSH_AUTH_SUCCESS
+    }
+    None => return SSH_AUTH_DENIED
+  }
+}
+
+// `password`: the server's `PasswordCheck` decides. A connection gets a
+// few attempts, so guessing costs a new connection each time.
+pub(pkg) fn on_auth_password(_session: ssh_session, user: String, password: String, data: Ptr[Unit]) -> i32 {
+  let state = CHandle[State].get(data)
+  if state.value.password_attempts >= MAX_PASSWORD_ATTEMPTS {
+    return SSH_AUTH_DENIED
+  }
+  state.value.password_attempts += 1
+  // A copy: the check may wait, and the state must not stay borrowed.
+  let check = state.value.password
+  match check {
+    Some(accepts) => {
+      if accepts(user, password) {
+        state.value.user = user
+        state.value.identity = Some(Password(user))
+        return SSH_AUTH_SUCCESS
+      }
+      return SSH_AUTH_DENIED
     }
     None => return SSH_AUTH_DENIED
   }
