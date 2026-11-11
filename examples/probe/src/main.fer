@@ -1,16 +1,18 @@
 // `probe`: the `ssh` package from the command line, for `scripts/interop`.
 //
-//   probe serve port=2301 host_key=FILE
+//   probe serve port=2301 host_key=FILE accept=NAME:PASSWORD
 //   probe connect port=2300 user=NAME policy=strict known_hosts=FILE key=FILE
 //   probe run ... command=TEXT timeout_ms=5000 max_output=65536
 //   probe shell ... expect=TEXT send=TEXT resize=100x30 end=
 //
 // `serve` is an echo server: it greets, sends back what the client types,
-// reports window changes, and ends the session at `q`. The other actions
+// reports window changes, and ends the session at `q`; with `accept` it
+// also lets that one user in by that password. The other actions
 // connect with `ssh.client` (`policy` is `strict`, `accept-new`, or
 // `pin` with `pin=SHA256:...`; `key=`, `passphrase=`, `agent=`, and
 // `password=` add authentication methods in the order given) and print
-// one line per result; a failure prints `error <Kind>: <message>` and
+// one line per result (`run` shows at most the first 200 bytes of each
+// stream); a failure prints `error <Kind>: <message>` and
 // exits with status 1. `shell` runs its steps in order: `send` types
 // text, `expect` waits for the output to hold a text, `resize` changes
 // the window, `end` waits for the shell to end.
@@ -41,7 +43,7 @@ use ssh.client.{
 }
 use ssh.error.{Config, SshError}
 use ssh.server.serve
-use ssh.session.{Input, Session}
+use ssh.session.{Input, PasswordCheck, Session}
 
 struct Arg {
   name: String,
@@ -187,12 +189,22 @@ fn run_steps(console: Console, clock: Clock, args: List[Arg], shell: mut Shell) 
 
 fn act(env: Env, action: String, args: List[Arg]) -> Result[Bool, SshError] {
   if action == "serve" {
+    let accepted = find(args, "accept", "")
+    var password: Option[PasswordCheck] = None
+    if !accepted.is_empty() {
+      password = Some(
+        fn(user: String, password: String) -> Bool {
+          return "{user}:{password}" == accepted
+        }
+      )
+    }
     let config = ssh.server.Config {
       address: find(args, "address", "127.0.0.1"),
       port: number(args, "port", 2301),
       host_key: Path.from(find(args, "host_key", "host_key")),
       max_connections: 8,
       allow_guests: false,
+      password: password,
       login_timeout: Duration.seconds(10),
     }
     serve(env.actors, env.clock, env.fs, config, echo)?
@@ -204,8 +216,9 @@ fn act(env: Env, action: String, args: List[Arg]) -> Result[Bool, SshError] {
     let timeout = Duration.milliseconds(number(args, "timeout_ms", 5000))
     let output = client.run(find(args, "command", "true"), timeout, number(args, "max_output", 65536))?
     env.console.print("status {output.status}")
-    env.console.print("stdout {shown(output.stdout)}")
-    env.console.print("stderr {shown(output.stderr)}")
+    env.console.print("sizes {output.stdout.len()} {output.stderr.len()}")
+    env.console.print("stdout {shown(output.stdout[..output.stdout.len().min(200)])}")
+    env.console.print("stderr {shown(output.stderr[..output.stderr.len().min(200)])}")
   }
   if action == "shell" {
     let pty = Pty {
