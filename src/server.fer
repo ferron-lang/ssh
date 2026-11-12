@@ -77,12 +77,12 @@ use pkg.sys.server.{
 
 const POLLIN: i16 = 1i16
 
-// shortcut: `size_of[T]()` with a lowercase `T` (the C names `anvil ffi
-// gen` keeps) fails to check, F1333 and F1332 (reproduction in the
-// project's ferron-bugs/size_of_lowercase_type); drop these aliases when
-// it checks.
+// shortcut: in Ferron 0.10.0-alpha.3 `size_of[T]()` with a lowercase `T`
+// (the C names `anvil ffi gen` keeps) fails to check with F1333 and F1332,
+// as if `T` were a value; drop these aliases when it checks.
 type ChannelCallbacks = ssh_channel_callbacks_struct
 type ServerCallbacks = ssh_server_callbacks_struct
+
 // How long a client has to end the connection after its channel closed.
 const CLOSE_TIMEOUT: Duration = Duration.seconds(2)
 // Polls of the listening socket that may fail in a row before `serve`

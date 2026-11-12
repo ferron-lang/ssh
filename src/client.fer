@@ -549,10 +549,10 @@ fn is_fingerprint(text: String) -> Bool {
 
 // shortcut: a `match` that binds a secret inside a borrowed value closes
 // it when it is reached through `for x in list` or through a field bound by
-// an outer `match` (Ferron bug, reproduction in the project's
-// ferron-bugs/secret_closed_by_match.fer). The loops over `config.auth` go
-// by index, and a passphrase is matched in one nested pattern, until that
-// is fixed.
+// an outer `match` (a bug in Ferron 0.10.0-alpha.3: the next `expose_bytes`
+// aborts with "invalid std.crypto arguments"). The loops over `config.auth`
+// go by index, and a passphrase is matched in one nested pattern, until
+// that is fixed.
 
 // Rejects a config libssh would read differently from how it is written.
 fn validate(config: ClientConfig) -> Result[Unit, SshError] {

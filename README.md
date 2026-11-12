@@ -19,10 +19,10 @@ Add it to the `anvil.toml` of a package as a git dependency pinned by tag:
 
 ```toml
 [dependencies]
-ssh = { git = "https://github.com/ferron-lang/ssh", tag = "v0.1.0" }
+ssh = { git = "https://github.com/ferron-lang/ssh", tag = "v0.2.0" }
 ```
 
-and import it as `ssh`. It needs `ferron` 0.10.0-alpha.2 or newer.
+and import it as `ssh`. It needs `ferron` 0.10.0-alpha.3 or newer.
 Versions stay `v0.x` until the API settles: the minor version marks
 changes that may break callers, the patch version fixes; `CHANGELOG.md`
 lists them.

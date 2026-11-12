@@ -3,6 +3,36 @@
 Versions stay `v0.x` until the API settles: the minor version marks changes
 that may break callers, the patch version marks fixes.
 
+## v0.2.0
+
+Moves to Ferron 0.10.0-alpha.3. Breaking for callers: secrets are
+`std.crypto` secrets, and `SshError` gained a field and lost `Eq`.
+
+- Requires `ferron >=0.10.0-alpha.3`; CI pins `FERRON_REF:
+  v0.10.0-alpha.3`.
+- Passwords and passphrases are `std.crypto.Secret` on both sides.
+  `ssh.client.Secret` and `Secret.new(text)` are gone: write
+  `Secret.from_bytes(text.utf8_bytes())`. A secret is affine, so `Auth`
+  and `ClientConfig` move instead of being copied (`auth: move auth`).
+  Secrets are zeroed when released.
+- `PasswordCheck` is `dyn Callable[(String, Secret), Bool] + send`: the
+  server's check gets the password as a secret and reads it with
+  `expose_bytes()`.
+- `SshError` has `cause: Option[ActorError]`, its `#[source]`: an `Actor`
+  error keeps the `ActorError` behind it, which `source()` and
+  `AnyError.downcast` find. `SshError` no longer derives `Eq`, since
+  `ActorError` has none; compare errors by `kind`. A struct literal of
+  `SshError` needs `cause: None`.
+- `SshErrorKind` derives `Variants` (`variants()`, `name()`,
+  `from_name()`, `Parse`).
+- Each server connection's session moves into its actor at spawn and
+  closes when the actor ends.
+- The binding generates both key file functions with a NULL passphrase
+  (`[nullable]` in `ffi.toml`) and sizes the callback tables with
+  `size_of`; `src/sys/hand.fer` keeps only libc's `umask`.
+- The README lists the algorithms the server offers and the package's
+  limits, and documents every public item.
+
 ## v0.1.0
 
 First release: SSH for Ferron programs, both sides, through FFI over the

@@ -8,7 +8,7 @@ env:
   # The ferron-lang/ferron release tag (`vX.Y.Z-alpha.N`) or commit this
   # package is tested with; move it together with the `ferron` requirement
   # in anvil.toml.
-  FERRON_REF: v0.10.0-alpha.2
+  FERRON_REF: v0.10.0-alpha.3
   # The libssh release the package is built and its binding checked with.
   # The runner's own libssh-dev is too old (0.10 on Ubuntu 24.04, 0.11 on
   # 26.04; the package needs 0.12), so CI builds this one from its sources.

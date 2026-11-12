@@ -1,6 +1,6 @@
 [package]
 name = "ssh"
-version = "0.1.0"
+version = "0.2.0"
 ferron = ">=0.10.0-alpha.3"
 license = "MIT"
 ffi = true
