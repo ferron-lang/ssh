@@ -135,11 +135,14 @@ pub type Auth =
 pub struct ClientConfig {
   /// A host name or an IP address.
   pub host: String,
+  /// The TCP port, 1 to 65535; SSH's is 22.
   pub port: Int,
+  /// The user name to log in as.
   pub user: String,
   /// The longest wait for the connection, and then for each answer of the
   /// server.
   pub timeout: Duration,
+  /// How the server's host key is checked.
   pub host_key: HostKeyPolicy,
   /// The methods to try, in order, until one lets the client in.
   pub auth: List[Auth],
@@ -150,7 +153,9 @@ pub struct ClientConfig {
 pub struct Pty {
   /// The terminal type, such as `xterm-256color`.
   pub term: String,
+  /// The width in cells, 1 to 1000.
   pub columns: Int,
+  /// The height in cells, 1 to 1000.
   pub rows: Int,
 }
 
@@ -168,8 +173,11 @@ pub type ExitStatus =
 /// What a command wrote and how it ended.
 #[derive(Eq)]
 pub struct CommandOutput {
+  /// What it wrote to its standard output.
   pub stdout: Bytes,
+  /// What it wrote to its standard error.
   pub stderr: Bytes,
+  /// How it ended.
   pub status: ExitStatus,
 }
 

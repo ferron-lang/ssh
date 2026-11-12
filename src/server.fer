@@ -93,6 +93,7 @@ const MAX_LISTENER_FAILURES: Int = 100
 pub struct Config {
   /// The address to bind, such as `127.0.0.1` or `0.0.0.0`.
   pub address: String,
+  /// The TCP port to listen on.
   pub port: Int,
   /// The file of the server's Ed25519 host key, created with mode 0600 on
   /// the first run.

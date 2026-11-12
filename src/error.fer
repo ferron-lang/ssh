@@ -46,8 +46,12 @@ pub type SshErrorKind =
 #[derive(Error)]
 #[error("{kind}: {message}")]
 pub struct SshError {
+  /// Which step failed.
   pub kind: SshErrorKind,
+  /// What went wrong, for people; libssh's message where it gave one.
+  /// It never holds a password or a passphrase.
   pub message: String,
+  /// The failure behind this one: the `ActorError` of an `Actor` error.
   #[source]
   pub cause: Option[ActorError],
 }

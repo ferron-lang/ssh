@@ -150,6 +150,8 @@ impl Session {
     return self.state.value.user
   }
 
+  /// Who the client proved to be: its key, its password login, or
+  /// `Guest`.
   pub fn identity(self) -> Identity {
     return self.state.value.identity.unwrap_or(Guest)
   }

@@ -90,7 +90,9 @@ fn main(env: Env) -> Result[Unit, SshError] {
   `keyboard-interactive` with no prompt as `Guest`. `session.user()` is
   whatever name the client typed and proves nothing. With
   `password: Some(check)`, `check(user, password)` decides who comes in by
-  password, as `Password(user)`; a connection gets three attempts.
+  password, as `Password(user)`; a connection gets three attempts. The
+  password reaches `check` as a `std.crypto.Secret`, whose bytes come out
+  only through `expose_bytes()`.
 - **The terminal.** `session.term()` and `session.size()` come from the
   client's `pty-req`, `session.variable("COLORTERM")` from its `SendEnv`.
   `poll` returns the bytes it typed (feed them to a `std.term.Decoder`),
@@ -103,8 +105,9 @@ fn main(env: Env) -> Result[Unit, SshError] {
 ### A client
 
 ```ferron
-use ssh.client.{AcceptNew, Agent, ClientConfig, Code, KeyFile, connect}
+use ssh.client.{AcceptNew, Agent, ClientConfig, ExitStatus, KeyFile, Password, connect}
 use ssh.error.SshError
+use std.crypto.Secret
 use std.env.Env
 use std.fs.Path
 use std.time.Duration
@@ -116,11 +119,15 @@ fn main(env: Env) -> Result[Unit, SshError] {
     user: "ann",
     timeout: Duration.seconds(10),
     host_key: AcceptNew(Path.from("known_hosts")),
-    auth: [KeyFile(Path.from("id_ed25519"), None), Agent],
+    auth: [
+      KeyFile(Path.from("id_ed25519"), None),
+      Agent,
+      Password(Secret.from_bytes(env.vars.get("ANN_PASSWORD").unwrap_or("").utf8_bytes())),
+    ],
   }
   let client = connect(env.net, env.fs, env.clock, config)?
   let output = client.run("uname -a", Duration.seconds(30), 65536)?
-  if output.status == Code(0) {
+  if output.status == ExitStatus.Code(0) {
     env.console.print(String.from_utf8_lossy(output.stdout))
   }
   return Ok(Unit)
@@ -132,7 +139,9 @@ fn main(env: Env) -> Result[Unit, SshError] {
 an `SshError` whose `kind` says which step failed: `Config` (nothing was
 sent), `Connect`, `Timeout`, `HostKeyUnknown`, `HostKeyChanged`,
 `KnownHosts`, `Authentication`, and later `Channel`, `TooLarge`, and
-`Closed`.
+`Closed`. Every error is one `SshError { kind, message, cause }`; `cause`
+holds the `ActorError` behind an `Actor` failure, which `source()` and
+`AnyError.downcast` find. Compare errors by `kind`.
 
 - **`client.run(command, timeout, max_output)`** runs a command in the
   user's shell, with nothing on its standard input, and returns a
@@ -200,11 +209,15 @@ sent), `Connect`, `Timeout`, `HostKeyUnknown`, `HostKeyChanged`,
   in, the `Authentication` error says what each attempt came to and which
   methods the server accepts. An encrypted key without its passphrase
   fails; nothing ever prompts on the terminal.
-- **Secrets.** A password or passphrase is a `Secret` (`Secret.new(text)`),
-  which displays as `<secret>`: printing a config does not show it, and no
-  error message holds one. They are ordinary strings in memory and are not
-  wiped. The server's `PasswordCheck` gets the password as a `String` and
-  must not log it.
+- **Secrets.** Passwords and passphrases are `std.crypto.Secret` values on
+  both sides: the client's `Auth.Password` and `Auth.KeyFile` passphrase,
+  and the password the server hands to its `PasswordCheck`. A secret
+  displays as `<secret>` (printing a config shows none, and no error
+  message holds one), is affine (an `Auth` and the `ClientConfig` holding
+  it move, they are not copied), and is zeroed when it is released. Its
+  bytes leave it only through `expose_bytes()`, which this package calls
+  where libssh needs the text and does not keep the result. libssh keeps
+  its own copies while it uses them, which this package cannot wipe.
 - **Limits.** Every client wait ends: `ClientConfig.timeout` bounds the
   connection and each answer of the server, `run` takes its own timeout
   and output cap, and `Shell.poll` returns about 1 MiB at most. The
@@ -219,6 +232,40 @@ sent), `Connect`, `Timeout`, `HostKeyUnknown`, `HostKeyChanged`,
   Call the client from `main` or from an actor spawned with
   `scope.spawn_pinned`; a `Client` is not sendable and stays where
   `connect` made it.
+
+## Algorithms
+
+libssh negotiates the transport, and this package keeps libssh 0.12's
+defaults on both sides. Against OpenSSH 10 the server offers:
+
+| | |
+|---|---|
+| Key exchange | `mlkem768x25519-sha256`, `mlkem768nistp256-sha256`, `mlkem1024nistp384-sha384`, `sntrup761x25519-sha512`, `curve25519-sha256`, `ecdh-sha2-nistp256/384/521`, `diffie-hellman-group18/16/14` and `group-exchange-sha256`, and `kex-strict-s-v00@openssh.com` (strict key exchange against Terrapin, CVE-2023-48795) |
+| Host key | `ssh-ed25519` only: the server makes and loads one Ed25519 key |
+| Ciphers | `chacha20-poly1305@openssh.com`, `aes256-gcm@openssh.com`, `aes128-gcm@openssh.com`, `aes256/192/128-ctr` |
+| MACs (for the CTR ciphers) | `hmac-sha2-256-etm@openssh.com`, `hmac-sha2-512-etm@openssh.com`, `hmac-sha2-256`, `hmac-sha2-512` |
+| Compression | `none`, `zlib@openssh.com` (after authentication only) |
+
+Nothing with SHA-1, no CBC ciphers, no DSA or RSA host keys on the
+server. The client accepts the host key types libssh 0.12 accepts
+(Ed25519, ECDSA, RSA with SHA-2).
+
+## Limits
+
+- **libssh 0.12 or newer**, on Linux and macOS; Windows is untested.
+- **One OS thread per connection** on the server, and one per `Client`:
+  libssh's calls block, and Ferron has no pool for blocking C calls yet.
+  Fine for tens or a few hundred connections; set `max_connections` to
+  what the machine can hold.
+- **The server serves terminal programs only**: one `session` channel
+  with a shell. It refuses `exec`, subsystems (`sftp`), port forwarding,
+  agent and X11 forwarding, and a second channel.
+- **The client** runs commands and shells. It has no SFTP, no port
+  forwarding, no `keyboard-interactive` login, and no host key types
+  beyond libssh's.
+- **Terminal input** arrives as raw bytes (`Input.Data`): decode it with
+  `std.term.Decoder`, which also handles a lone Esc
+  (`Decoder.ESCAPE_TIMEOUT`, `expire`).
 
 ## Develop
 
@@ -252,8 +299,9 @@ names the `anvil` to build the probe with.
 libssh headers. `ffi.toml` pins the binding to the functions the safe
 layer calls (`ignore = "."` plus a `require` list), so the output is the
 same for the libssh 0.12.0 and 0.12.2 headers; using another function
-means adding it to `require`. `src/sys/hand.fer` declares by hand the two
-key file functions whose passphrase may be NULL, and libc's `umask`.
+means adding it to `require`. `[nullable]` lets the key file functions
+take a NULL passphrase. `src/sys/hand.fer` declares libc's `umask`, the
+one call outside libssh.
 
 ## CI
 
