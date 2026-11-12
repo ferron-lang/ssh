@@ -16,8 +16,9 @@
 // libssh was asked to wait.
 
 use std.bytes.Bytes
+use std.crypto.Secret
 use std.encoding.base64
-use std.ffi.{CBuffer, CLong, CStr, Out, Ptr}
+use std.ffi.{CBuffer, CFn, CLong, CStr, Out, Ptr}
 use std.fs.{Fs, Path}
 use std.net.Net
 use std.test.TestContext
@@ -47,7 +48,6 @@ use pkg.error.{
   TooLarge,
   failure
 }
-use pkg.sys.hand.ssh_pki_import_privkey_file
 use pkg.sys.libssh.{
   ssh_channel,
   ssh_channel_change_pty_size,
@@ -79,6 +79,7 @@ use pkg.sys.libssh.{
   ssh_new,
   ssh_options_e,
   ssh_options_set,
+  ssh_pki_import_privkey_file,
   ssh_session,
   ssh_session_is_known_server,
   ssh_session_update_known_hosts,
@@ -103,26 +104,6 @@ const MAX_TEXT: Int = 4096
 const MAX_WINDOW: Int = 1000
 const PIN_PREFIX: String = "SHA256:"
 
-/// A password or a passphrase. It displays as `<secret>`, so a config that
-/// is printed or logged does not show it.
-#[derive(Eq)]
-pub struct Secret {
-  text: String,
-}
-
-impl Secret {
-  /// Wraps `text`, a password or a passphrase.
-  pub fn new(text: String) -> Secret {
-    return Secret { text: text }
-  }
-}
-
-impl Display for Secret {
-  fn to_string(self) -> String {
-    return "<secret>"
-  }
-}
-
 /// How the server's host key is checked. Every policy fails with
 /// `HostKeyChanged` when the key is not the one expected.
 #[derive(Eq)]
@@ -137,8 +118,9 @@ pub type HostKeyPolicy =
   /// `SHA256:<base64>` (what `ssh-keygen -l` prints); no file is read.
   | Fingerprint(sha256: String)
 
-/// One way to authenticate.
-#[derive(Eq)]
+/// One way to authenticate. Passwords and passphrases are `std.crypto`
+/// secrets: they display as `<secret>`, are zeroed when released, and
+/// make an `Auth`, and the `ClientConfig` holding it, affine.
 pub type Auth =
   /// A private key file in OpenSSH or PEM format, with the passphrase
   /// that decrypts it when it has one.
@@ -239,14 +221,14 @@ fn close_shell(shell: Shell) -> Unit {
 /// per step.
 pub fn connect(_net: Net, fs: Fs, clock: Clock, config: ClientConfig) -> Result[Client, SshError] {
   validate(config)?
-  for method in config.auth {
-    match method {
-      KeyFile(path, _) => {
+  for index in 0..config.auth.len() {
+    match config.auth[index] {
+      KeyFile(path, _passphrase) => {
         if !fs.is_file(path) {
           return Err(failure(Config, "the key file {path} does not exist"))
         }
       }
-      _ => {
+      _other => {
       }
     }
   }
@@ -531,6 +513,21 @@ fn is_plain(text: String) -> Bool {
   return !text.contains("\0")
 }
 
+// Whether a password or passphrase can go to libssh as a C string. The
+// bytes are looked at and dropped, never kept.
+fn is_secret_text(secret: Secret) -> Bool {
+  match String.from_utf8(secret.expose_bytes()) {
+    Ok(text) => return is_plain(text)
+    Err(_) => return false
+  }
+}
+
+// The secret as the C string libssh takes. libssh copies it; the copy
+// here lives until the call returns.
+fn secret_text(secret: Secret) -> String {
+  return String.from_utf8(secret.expose_bytes()).unwrap_or("")
+}
+
 // Whether `text` is a `SHA256:<base64>` fingerprint: 32 bytes, unpadded.
 fn is_fingerprint(text: String) -> Bool {
   if !text.starts_with(PIN_PREFIX) || text.contains("=") {
@@ -541,6 +538,13 @@ fn is_fingerprint(text: String) -> Bool {
     Err(_) => return false
   }
 }
+
+// shortcut: a `match` that binds a secret inside a borrowed value closes
+// it when it is reached through `for x in list` or through a field bound by
+// an outer `match` (Ferron bug, reproduction in the project's
+// ferron-bugs/secret_closed_by_match.fer). The loops over `config.auth` go
+// by index, and a passphrase is matched in one nested pattern, until that
+// is fixed.
 
 // Rejects a config libssh would read differently from how it is written.
 fn validate(config: ClientConfig) -> Result[Unit, SshError] {
@@ -583,19 +587,22 @@ fn validate(config: ClientConfig) -> Result[Unit, SshError] {
   if config.auth.is_empty() {
     return Err(failure(Config, "no authentication method is given"))
   }
-  for method in config.auth {
-    match method {
-      KeyFile(path, passphrase) => {
+  for index in 0..config.auth.len() {
+    match config.auth[index] {
+      KeyFile(path, Some(passphrase)) => {
         validate_path(path, "key file")?
-        if !is_plain(passphrase.unwrap_or(Secret.new("")).text) {
-          return Err(failure(Config, "the passphrase holds a NUL"))
+        if !is_secret_text(passphrase) {
+          return Err(failure(Config, "the passphrase is not UTF-8 or holds a NUL"))
         }
       }
+      KeyFile(path, None) => validate_path(path, "key file")?
       Agent => {
       }
       Password(password) => {
-        if !is_plain(password.text) || password.text.len() > MAX_TEXT {
-          return Err(failure(Config, "the password holds a NUL or is longer than {MAX_TEXT}"))
+        if !is_secret_text(password) || password.expose_bytes().len() > MAX_TEXT {
+          return Err(
+            failure(Config, "the password is not UTF-8, holds a NUL, or is longer than {MAX_TEXT} bytes")
+          )
         }
       }
     }
@@ -617,27 +624,10 @@ fn set_text(session: ssh_session, option: ssh_options_e, text: String) -> Bool {
   }
 }
 
-// shortcut: a buffer whose `ptr()` is taken in the right operand of `&&`
-// passes `anvil check` and fails `anvil build` (F1201, "MIR ownership
-// mismatch"), so every option that needs a buffer has a function of its
-// own and `configure` chains the calls; inline them once that builds.
-fn set_long(session: ssh_session, option: ssh_options_e, number: Int) -> Bool {
-  var value = CBuffer[CLong].new(1)
-  value[0] = number
-  return ssh_options_set(session, option, value.ptr().cast[Unit]()) == SSH_OK
-}
-
-fn set_port(session: ssh_session, port: Int) -> Bool {
-  var value = CBuffer[u32].new(1)
-  value[0] = port.try_to_u32().unwrap_or(0u32)
-  return ssh_options_set(session, ssh_options_e.Port, value.ptr().cast[Unit]()) == SSH_OK
-}
-
-// Keeps libssh from reading `~/.ssh/config` and `/etc/ssh/ssh_config`.
-fn skip_config_files(session: ssh_session) -> Bool {
-  var process = CBuffer[u8].new(1)
-  process[0] = 0u8
-  return ssh_options_set(session, ssh_options_e.ProcessConfig, process.ptr().cast[Unit]()) == SSH_OK
+// Sets an option libssh reads as a number of C type `T`.
+fn set_value[T](session: ssh_session, option: ssh_options_e, value: T) -> Bool {
+  var buffer = CBuffer.from([value])
+  return ssh_options_set(session, option, buffer.ptr().cast[Unit]()) == SSH_OK
 }
 
 // Sets the options of a new session. Nothing is read from the user's
@@ -652,14 +642,16 @@ fn configure(session: ssh_session, config: ClientConfig) -> Result[Unit, SshErro
     }
   }
   let milliseconds = config.timeout.as_milliseconds()
-  let ok = skip_config_files(session)
+  // `ProcessConfig` off keeps libssh from reading `~/.ssh/config` and
+  // `/etc/ssh/ssh_config`.
+  let ok = set_value(session, ssh_options_e.ProcessConfig, 0u8)
     && set_text(session, ssh_options_e.Host, config.host)
     && set_text(session, ssh_options_e.User, config.user)
-    && set_port(session, config.port)
+    && set_value(session, ssh_options_e.Port, config.port.try_to_u32().unwrap_or(0u32))
     && set_text(session, ssh_options_e.Knownhosts, known_hosts)
     && set_text(session, ssh_options_e.GlobalKnownhosts, "/dev/null")
-    && set_long(session, ssh_options_e.Timeout, milliseconds / 1000)
-    && set_long(session, ssh_options_e.TimeoutUsec, milliseconds % 1000 * 1000)
+    && set_value[CLong](session, ssh_options_e.Timeout, milliseconds / 1000)
+    && set_value[CLong](session, ssh_options_e.TimeoutUsec, milliseconds % 1000 * 1000)
   if !ok {
     return Err(failure(Config, "libssh refused an option: {session_error(session)}"))
   }
@@ -762,9 +754,9 @@ fn method_names(methods: i32) -> String {
 // names the method and the key file, never a secret.
 fn describe(method: Auth) -> String {
   match method {
-    KeyFile(path, _) => return "the key {path}"
+    KeyFile(path, _passphrase) => return "the key {path}"
     Agent => return "the agent"
-    Password(_) => return "the password"
+    Password(_password) => return "the password"
   }
 }
 
@@ -802,13 +794,13 @@ fn authenticate(session: ssh_session, clock: Clock, config: ClientConfig) -> Res
     }
   }
   var attempts: List[String] = []
-  for method in config.auth {
+  for index in 0..config.auth.len() {
     let offered = ssh_userauth_list(session, config.user)
     var outcome = SSH_AUTH_DENIED
-    match method {
+    match config.auth[index] {
       KeyFile(path, passphrase) => {
         if offered & SSH_AUTH_METHOD_PUBLICKEY == 0i32 {
-          attempts.push("{describe(method)}: the server takes no keys")
+          attempts.push("{describe(config.auth[index])}: the server takes no keys")
           continue
         }
         match load_key(path, passphrase) {
@@ -818,7 +810,7 @@ fn authenticate(session: ssh_session, clock: Clock, config: ClientConfig) -> Res
           }
           None => {
             attempts.push(
-              "{describe(method)}: cannot be read (not a private key, or the passphrase is wrong or missing)"
+              "{describe(config.auth[index])}: cannot be read (not a private key, or the passphrase is wrong or missing)"
             )
             continue
           }
@@ -826,27 +818,27 @@ fn authenticate(session: ssh_session, clock: Clock, config: ClientConfig) -> Res
       }
       Agent => {
         if offered & SSH_AUTH_METHOD_PUBLICKEY == 0i32 {
-          attempts.push("{describe(method)}: the server takes no keys")
+          attempts.push("{describe(config.auth[index])}: the server takes no keys")
           continue
         }
         outcome = ssh_userauth_agent(session, config.user)
         if outcome == SSH_AUTH_DENIED {
-          attempts.push("{describe(method)}: no agent, or none of its keys was accepted")
+          attempts.push("{describe(config.auth[index])}: no agent, or none of its keys was accepted")
           continue
         }
       }
       Password(password) => {
         if offered & SSH_AUTH_METHOD_PASSWORD == 0i32 {
-          attempts.push("{describe(method)}: the server takes no passwords")
+          attempts.push("{describe(config.auth[index])}: the server takes no passwords")
           continue
         }
-        outcome = ssh_userauth_password(session, config.user, password.text)
+        outcome = ssh_userauth_password(session, config.user, secret_text(password))
       }
     }
     if outcome == SSH_AUTH_SUCCESS {
       return Ok(Unit)
     }
-    attempts.push("{describe(method)}: {refusal(outcome)}")
+    attempts.push("{describe(config.auth[index])}: {refusal(outcome)}")
     if ssh_is_connected(session) == 0i32 {
       attempts.push("the server closed the connection")
       break
@@ -867,15 +859,13 @@ fn authenticate(session: ssh_session, clock: Clock, config: ClientConfig) -> Res
 // passphrase, so an encrypted key without one fails instead of prompting.
 fn load_key(path: Path, passphrase: Option[Secret]) -> Option[ssh_key] {
   let out = Out[ssh_key].new()
-  var outcome = SSH_OK
+  var text: Option[String] = None
   match passphrase {
-    Some(secret) => {
-      with text = CStr.from(secret.text) {
-        outcome = ssh_pki_import_privkey_file("{path}", text.ptr(), Ptr.null(), Ptr.null(), out)
-      }
+    Some(secret) => text = Some(secret_text(secret))
+    None => {
     }
-    None => outcome = ssh_pki_import_privkey_file("{path}", Ptr.null(), Ptr.null(), Ptr.null(), out)
   }
+  let outcome = ssh_pki_import_privkey_file("{path}", text, CFn.from_ptr(Ptr[Unit].null()), Ptr.null(), out)
   if outcome != SSH_OK || out.get().is_null() {
     return None
   }
@@ -909,16 +899,18 @@ fn verdict(found: Verdict) -> String {
   }
 }
 
+fn secret(text: String) -> Secret {
+  return Secret.from_bytes(text.utf8_bytes())
+}
+
 #[test("a secret never shows in text")]
 fn secrets_are_hidden() -> Unit {
-  let methods = [
-    Auth.Password(Secret.new("hunter2")),
-    Auth.KeyFile(Path.from("key"), Some(Secret.new("open sesame"))),
-    Auth.Agent,
-  ]
-  expect.equal("{methods}", "[Password(<secret>), KeyFile(key, Some(<secret>)), Agent]")
-  expect.equal(methods.map(describe), ["the password", "the key key", "the agent"])
-  expect.equal(Secret.new("a") == Secret.new("a"), true)
+  let password = Auth.Password(secret("hunter2"))
+  let key = Auth.KeyFile(Path.from("key"), Some(secret("open sesame")))
+  expect.equal("{password} {key} {Auth.Agent}", "Password(<secret>) KeyFile(key, Some(<secret>)) Agent")
+  expect.equal(describe(password), "the password")
+  expect.equal(describe(key), "the key key")
+  expect.equal(describe(Auth.Agent), "the agent")
 }
 
 #[test("a config is validated before anything is sent")]
@@ -953,13 +945,16 @@ fn config_validation() -> Unit {
   config.timeout = Duration.milliseconds(1)
   config.auth = []
   expect.equal(validated(config), "Config: no authentication method is given")
-  config.auth = [Password(Secret.new("a\0b"))]
-  expect.equal(validated(config), "Config: the password holds a NUL or is longer than 4096")
-  config.auth = [KeyFile(Path.from("key"), Some(Secret.new("a\0b")))]
-  expect.equal(validated(config), "Config: the passphrase holds a NUL")
+  config.auth = [Auth.Password(secret("a\0b"))]
+  expect.equal(
+    validated(config),
+    "Config: the password is not UTF-8, holds a NUL, or is longer than 4096 bytes"
+  )
+  config.auth = [Auth.KeyFile(Path.from("key"), Some(secret("a\0b")))]
+  expect.equal(validated(config), "Config: the passphrase is not UTF-8 or holds a NUL")
   config.auth = [KeyFile(Path.from(""), None)]
   expect.equal(validated(config), "Config: the key file path is empty, longer than 4096, or holds a NUL")
-  config.auth = [Agent, Password(Secret.new("pw"))]
+  config.auth = [Auth.Agent, Auth.Password(secret("pw"))]
   expect.equal(validated(config), "ok")
   config.host_key = AcceptNew(Path.from(""))
   expect.equal(validated(config), "Config: the known_hosts path is empty, longer than 4096, or holds a NUL")
@@ -969,15 +964,15 @@ fn config_validation() -> Unit {
 
 #[test("a pinned fingerprint is SHA256 and 32 bytes of unpadded base64")]
 fn fingerprint_format() -> Unit {
-  expect.equal(is_fingerprint("SHA256:WvfuSi+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni8"), true)
-  expect.equal(is_fingerprint("SHA256:WvfuSi+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni8="), false)
-  expect.equal(is_fingerprint("SHA256:WvfuSi+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni"), false)
-  expect.equal(is_fingerprint("SHA256:WvfuSi+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni8AAAA"), false)
-  expect.equal(is_fingerprint("SHA256:Wvfu Si+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni"), false)
-  expect.equal(is_fingerprint("MD5:16:27:ac:a5:76:28:2d:36:63:1b:56:4d:eb:df:a6:48"), false)
-  expect.equal(is_fingerprint("sha256:WvfuSi+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni8"), false)
-  expect.equal(is_fingerprint("SHA256:"), false)
-  expect.equal(is_fingerprint(""), false)
+  expect.is_true(is_fingerprint("SHA256:WvfuSi+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni8"))
+  expect.is_false(is_fingerprint("SHA256:WvfuSi+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni8="))
+  expect.is_false(is_fingerprint("SHA256:WvfuSi+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni"))
+  expect.is_false(is_fingerprint("SHA256:WvfuSi+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni8AAAA"))
+  expect.is_false(is_fingerprint("SHA256:Wvfu Si+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni"))
+  expect.is_false(is_fingerprint("MD5:16:27:ac:a5:76:28:2d:36:63:1b:56:4d:eb:df:a6:48"))
+  expect.is_false(is_fingerprint("sha256:WvfuSi+MOO7zW5l1fT63pbE30OOzTY65/I+gVDdCni8"))
+  expect.is_false(is_fingerprint("SHA256:"))
+  expect.is_false(is_fingerprint(""))
 }
 
 #[test("Strict accepts only a recorded key")]
@@ -1041,18 +1036,18 @@ fn login_errors() -> Unit {
 #[test("a step ran out of time by the clock or by libssh's word")]
 fn timeouts_are_recognized() -> Unit {
   let limit = Duration.seconds(2)
-  expect.equal(timed_out(Duration.seconds(2), limit, "Connection refused"), true)
-  expect.equal(timed_out(Duration.seconds(1), limit, "Connection refused"), false)
-  expect.equal(timed_out(Duration.seconds(0), limit, "Timeout connecting to 127.0.0.1"), true)
-  expect.equal(timed_out(Duration.seconds(0), limit, "Connection timed out"), true)
+  expect.is_true(timed_out(Duration.seconds(2), limit, "Connection refused"))
+  expect.is_false(timed_out(Duration.seconds(1), limit, "Connection refused"))
+  expect.is_true(timed_out(Duration.seconds(0), limit, "Timeout connecting to 127.0.0.1"))
+  expect.is_true(timed_out(Duration.seconds(0), limit, "Connection timed out"))
 }
 
 #[test("a window is 1 to 1000 cells each way")]
 fn window_bounds() -> Unit {
   expect.equal(window(80).ok(), Some(80i32))
   expect.equal(window(1000).ok(), Some(1000i32))
-  expect.equal(window(0).is_err(), true)
-  expect.equal(window(1001).is_err(), true)
+  expect.is_err(window(0))
+  expect.is_err(window(1001))
   expect.equal(window(-5).err().map(|error| error.kind), Some(Config))
 }
 
@@ -1086,7 +1081,7 @@ fn connect_failures(context: TestContext) -> Unit {
     let started = context.clock.now()
     // The listener never answers: the connection opens and no banner comes.
     expect.equal(connect_failure(context, config), "Timeout")
-    expect.equal(context.clock.since(started) < Duration.seconds(5), true)
+    expect.is_true(context.clock.since(started) < Duration.seconds(5))
   }
   var config = test_config()
   config.host = "127.0.0.1"

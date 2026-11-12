@@ -22,6 +22,7 @@ use std.env.Env
 use std.fs.Path
 use std.io.Console
 use std.process.ExitCode
+use std.crypto.Secret
 use std.time.{Clock, Duration}
 use ssh.client.{
   AcceptNew,
@@ -34,7 +35,6 @@ use ssh.client.{
   KeyFile,
   Password,
   Pty,
-  Secret,
   Shell,
   Stderr,
   Stdout,
@@ -82,16 +82,22 @@ fn client_config(args: List[Arg]) -> Result[ClientConfig, SshError] {
     }
     "accept-new" => policy = AcceptNew(known_hosts)
     "pin" => policy = Fingerprint(find(args, "pin", ""))
-    other => return Err(SshError { kind: Config, message: "unknown policy {other}" })
+    other => return Err(SshError { kind: Config, message: "unknown policy {other}", cause: None })
   }
-  var passphrase: Option[Secret] = None
+  // The passphrase given last applies to the keys after it.
+  var passphrase: Option[String] = None
   var auth: List[Auth] = []
   for arg in args {
     match arg.name {
-      "passphrase" => passphrase = Some(Secret.new(arg.value))
-      "key" => auth.push(KeyFile(Path.from(arg.value), passphrase))
+      "passphrase" => passphrase = Some(arg.value)
+      "key" => {
+        match passphrase {
+          Some(text) => auth.push(KeyFile(Path.from(arg.value), Some(secret(text))))
+          None => auth.push(KeyFile(Path.from(arg.value), None))
+        }
+      }
       "agent" => auth.push(Agent)
-      "password" => auth.push(Password(Secret.new(arg.value)))
+      "password" => auth.push(Password(secret(arg.value)))
       _ => {
       }
     }
@@ -103,7 +109,7 @@ fn client_config(args: List[Arg]) -> Result[ClientConfig, SshError] {
       user: find(args, "user", "probe"),
       timeout: Duration.milliseconds(number(args, "connect_timeout_ms", 5000)),
       host_key: policy,
-      auth: auth,
+      auth: move auth,
     }
   )
 }
@@ -187,14 +193,18 @@ fn run_steps(console: Console, clock: Clock, args: List[Arg], shell: mut Shell) 
   return Ok(ok)
 }
 
+fn secret(text: String) -> Secret {
+  return Secret.from_bytes(text.utf8_bytes())
+}
+
 fn act(env: Env, action: String, args: List[Arg]) -> Result[Bool, SshError] {
   if action == "serve" {
     let accepted = find(args, "accept", "")
     var password: Option[PasswordCheck] = None
     if !accepted.is_empty() {
       password = Some(
-        fn(user: String, password: String) -> Bool {
-          return "{user}:{password}" == accepted
+        fn(user: String, password: Secret) -> Bool {
+          return "{user}:".utf8_bytes() + password.expose_bytes() == accepted.utf8_bytes()
         }
       )
     }

@@ -5,8 +5,8 @@
 // the channel. Its calls block, so every connection is an actor pinned to
 // a thread of its own, and a slow client stalls nobody else.
 
-use std.actor.{ActorError, ActorSystem}
-use std.ffi.{CBuffer, CFn, CHandle, CStr, Out, Ptr}
+use std.actor.ActorSystem
+use std.ffi.{CBuffer, CFn, CHandle, CStr, Out, Ptr, size_of}
 use std.fs.{Fs, Path}
 use std.ref.Ref
 use std.time.{Clock, Duration}
@@ -37,7 +37,7 @@ use pkg.session.{
   on_window_change
 }
 use pkg.sys.callbacks.{ssh_channel_callbacks_struct, ssh_server_callbacks_struct, ssh_set_server_callbacks}
-use pkg.sys.hand.{ssh_pki_export_privkey_file, umask}
+use pkg.sys.hand.umask
 use pkg.sys.libssh.{
   ssh_channel_close,
   ssh_channel_is_open,
@@ -57,6 +57,7 @@ use pkg.sys.libssh.{
   ssh_key_free,
   ssh_keytypes_e,
   ssh_new,
+  ssh_pki_export_privkey_file,
   ssh_pki_generate_key,
   ssh_session
 }
@@ -75,16 +76,18 @@ use pkg.sys.server.{
 }
 
 const POLLIN: i16 = 1i16
+
+// shortcut: `size_of[T]()` with a lowercase `T` (the C names `anvil ffi
+// gen` keeps) fails to check, F1333 and F1332 (reproduction in the
+// project's ferron-bugs/size_of_lowercase_type); drop these aliases when
+// it checks.
+type ChannelCallbacks = ssh_channel_callbacks_struct
+type ServerCallbacks = ssh_server_callbacks_struct
 // How long a client has to end the connection after its channel closed.
 const CLOSE_TIMEOUT: Duration = Duration.seconds(2)
 // Polls of the listening socket that may fail in a row before `serve`
 // gives up.
 const MAX_LISTENER_FAILURES: Int = 100
-// `sizeof` of the callback structs, which libssh reads to learn which
-// fields the caller knows; the generated `#[c_layout]` checks hold the
-// same numbers.
-const SERVER_CALLBACKS_SIZE: usize = 104usize
-const CHANNEL_CALLBACKS_SIZE: usize = 152usize
 
 /// How `serve` listens and whom it lets in.
 pub struct Config {
@@ -127,9 +130,12 @@ struct RawSession {
 }
 
 type ConnectionMsg: send =
-  | Start(raw: RawSession)
+  | Serve
 
+// One connection, on a thread of its own. The session moves in at spawn
+// and closes when the actor ends.
 actor Connection(
+  raw: RawSession,
   clock: Clock,
   allow_guests: Bool,
   password: Option[PasswordCheck],
@@ -137,10 +143,12 @@ actor Connection(
   handler: Handler,
   slots: Receiver[Unit]
 ) receives ConnectionMsg {
-  on Start(raw) {
+  on Serve {
     run(clock, allow_guests, password, login_timeout, handler, raw)
-    // Gives back the slot `serve` took for this connection.
-    slots.receive()?
+    // Gives back the slot `serve` took for this connection. The channel is
+    // closed only when `serve` itself ends, and then there is nothing to
+    // give back.
+    let _ = slots.receive()
     exit
   }
 }
@@ -158,14 +166,14 @@ pub fn serve(actors: ActorSystem, clock: Clock, fs: Fs, config: Config, handler:
       if ssh_event_add_fd(ready.ptr, ssh_bind_get_fd(bind.ptr), POLLIN, CFn.from(on_listener_ready), Ptr.null()) != SSH_OK {
         return Err(failure(Listen, "cannot poll the listening socket"))
       }
-      accept_loop(actors, clock, config, handler, bind, ready)?
-      return Err(failure(Listen, "the listening socket failed"))
+      return accept_loop(actors, clock, config, handler, bind, ready)
     }
   }
 }
 
-// Accepts connections until the scope is cancelled, one pinned actor each.
-fn accept_loop(actors: ActorSystem, clock: Clock, config: Config, handler: Handler, bind: Bind, ready: EventLoop) -> Result[Unit, ActorError] {
+// Accepts connections, one pinned actor each, until the listening socket
+// keeps failing or the scope is cancelled.
+fn accept_loop(actors: ActorSystem, clock: Clock, config: Config, handler: Handler, bind: Bind, ready: EventLoop) -> Result[Unit, SshError] {
   with scope = actors.scope()? {
     // One value per live connection: a full channel is a full server.
     let slots: Channel[Unit] = actors.channel(capacity: config.max_connections.max(1))?
@@ -190,12 +198,20 @@ fn accept_loop(actors: ActorSystem, clock: Clock, config: Config, handler: Handl
         continue
       }
       let connection = scope.spawn_pinned(
-        Connection(clock, config.allow_guests, config.password, config.login_timeout, handler, slots.receiver)
+        Connection(
+          move raw,
+          clock,
+          config.allow_guests,
+          config.password,
+          config.login_timeout,
+          handler,
+          slots.receiver
+        )
       )?
-      connection.send(Start(move raw))?
+      connection.send(Serve)?
     }
   }
-  return Ok(Unit)
+  return Err(failure(Listen, "the listening socket failed {MAX_LISTENER_FAILURES} times in a row"))
 }
 
 fn event_loop() -> EventLoop {
@@ -251,7 +267,7 @@ fn ensure_host_key(fs: Fs, path: Path) -> Result[Unit, SshError] {
   }
   let key = out.get()
   let mask = umask(63u32)
-  let outcome = ssh_pki_export_privkey_file(key, Ptr.null(), Ptr.null(), Ptr.null(), "{path}")
+  let outcome = ssh_pki_export_privkey_file(key, None, CFn.from_ptr(Ptr[Unit].null()), Ptr.null(), "{path}")
   umask(mask)
   ssh_key_free(key)
   if outcome != SSH_OK {
@@ -272,7 +288,8 @@ fn run(
   let state = Ref.new(State.new(allow_guests, password))
   with handle = CHandle.new(state) {
     var channel_callbacks = ssh_channel_callbacks_struct.zeroed()
-    channel_callbacks.size = CHANNEL_CALLBACKS_SIZE
+    // libssh reads `size` to learn which fields the caller knows.
+    channel_callbacks.size = size_of[ChannelCallbacks]().try_to_usize().expect_ok("a struct size is positive")
     channel_callbacks.userdata = handle.ptr()
     channel_callbacks.channel_data_function = CFn.from(on_data)
     channel_callbacks.channel_eof_function = CFn.from(on_eof)
@@ -284,7 +301,7 @@ fn run(
     state.value.set_channel_callbacks(channel_callbacks.ptr().address())
 
     var server_callbacks = ssh_server_callbacks_struct.zeroed()
-    server_callbacks.size = SERVER_CALLBACKS_SIZE
+    server_callbacks.size = size_of[ServerCallbacks]().try_to_usize().expect_ok("a struct size is positive")
     server_callbacks.userdata = handle.ptr()
     server_callbacks.auth_pubkey_function = CFn.from(on_auth_pubkey)
     server_callbacks.auth_kbdint_function = CFn.from(on_auth_kbdint)

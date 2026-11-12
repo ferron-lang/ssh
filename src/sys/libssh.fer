@@ -149,6 +149,8 @@ extern "C" {
   pub fn ssh_key_type(key: ssh_key) -> ssh_keytypes_e
   pub fn ssh_key_type_to_char(type_: ssh_keytypes_e) -> Ptr[u8]
   pub fn ssh_pki_generate_key(type_: ssh_keytypes_e, pki_context: ssh_pki_ctx, pkey: Out[ssh_key]) -> i32
+  pub fn ssh_pki_import_privkey_file(filename: CStr, passphrase: Option[CStr], auth_fn: CFn[(CStr, Ptr[u8], usize, i32, i32, Ptr[Unit]), i32], auth_data: Ptr[Unit], pkey: Out[ssh_key]) -> i32
+  pub fn ssh_pki_export_privkey_file(privkey: ssh_key, passphrase: Option[CStr], auth_fn: CFn[(CStr, Ptr[u8], usize, i32, i32, Ptr[Unit]), i32], auth_data: Ptr[Unit], filename: CStr) -> i32
   pub fn ssh_get_fingerprint_hash(type_: ssh_publickey_hash_type, hash: CArray[u8], len: usize) -> Ptr[u8]
   pub fn ssh_userauth_none(session: ssh_session, username: CStr) -> i32
   pub fn ssh_userauth_list(session: ssh_session, username: CStr) -> i32

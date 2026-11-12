@@ -8,6 +8,7 @@
 
 use std.bytes.Bytes
 use std.collections.Map
+use std.crypto.Secret
 use std.ffi.{CBuffer, CHandle, Ptr}
 use std.ref.Ref
 use std.time.Duration
@@ -67,10 +68,13 @@ pub type Input =
   /// input, and every later `poll` returns it again.
   | Closed
 
-/// Decides whether a user name and a password are let in. It runs on the
-/// connection's thread while the client waits, and may take its time (a
-/// slow password hash); it must not log the password.
-pub type PasswordCheck = dyn Callable[(String, String), Bool] + send
+/// Decides whether a user name and a password are let in: `true` lets the
+/// client in, `false` refuses it (a wrong password, an unknown user, or a
+/// failure of the check itself). It runs on the connection's thread while
+/// the client waits, and may take its time (a slow password hash). The
+/// password is a `std.crypto` secret: it displays as `<secret>`, and its
+/// bytes come out only through `expose_bytes`.
+pub type PasswordCheck = dyn Callable[(String, Secret), Bool] + send
 
 // Passwords a connection may try before every further one is refused.
 const MAX_PASSWORD_ATTEMPTS: Int = 3
@@ -244,7 +248,9 @@ pub(pkg) fn on_auth_password(_session: ssh_session, user: String, password: Stri
   let check = state.value.password
   match check {
     Some(accepts) => {
-      if accepts(user, password) {
+      // libssh keeps its own copy of the password; this one is zeroed
+      // when the check returns.
+      if accepts(user, Secret.from_bytes(password.utf8_bytes())) {
         state.value.user = user
         state.value.identity = Some(Password(user))
         return SSH_AUTH_SUCCESS

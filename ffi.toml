@@ -50,7 +50,8 @@ require = [
   # Keys.
   "ssh_pki_generate_key", "ssh_pki_ctx", "ssh_key_free", "ssh_key_type",
   "ssh_key_type_to_char", "ssh_get_publickey_hash", "ssh_get_fingerprint_hash",
-  "ssh_clean_pubkey_hash", "ssh_string_free_char",
+  "ssh_clean_pubkey_hash", "ssh_string_free_char", "ssh_pki_export_privkey_file",
+  "ssh_pki_import_privkey_file",
 ]
 
 # `unsigned char **hash` and `ssh_key *pkey` are one value written by C.
@@ -63,6 +64,9 @@ out = ["hash"]
 [arrays.ssh_pki_generate_key]
 out = ["pkey"]
 
+[arrays.ssh_pki_import_privkey_file]
+out = ["pkey"]
+
 [arrays.ssh_get_server_publickey]
 out = ["key"]
 
@@ -71,3 +75,9 @@ array = { hash = "len" }
 
 [arrays.ssh_message_auth_interactive_request]
 array = { prompts = "num_prompts" }
+
+# A NULL passphrase writes an unencrypted key, and reads one without
+# asking; a NULL callback never prompts on the terminal.
+[nullable]
+ssh_pki_export_privkey_file = ["passphrase"]
+ssh_pki_import_privkey_file = ["passphrase"]
