@@ -261,9 +261,9 @@ pub fn connect(_net: Net, fs: Fs, clock: Clock, config: ClientConfig) -> Result[
   let started = clock.now()
   if ssh_connect(client.session) != SSH_OK {
     let reason = session_error(client.session)
-    var kind = Connect
+    var kind = SshErrorKind.Connect
     if timed_out(clock.since(started), config.timeout, reason) {
-      kind = Timeout
+      kind = SshErrorKind.Timeout
     }
     return Err(failure(kind, "{config.host} port {config.port}: {reason}"))
   }
@@ -722,7 +722,7 @@ fn verify_host_key(session: ssh_session, config: ClientConfig) -> Result[String,
   let print = fingerprint(key)
   ssh_key_free(key)
   let actual = print.ok_or(failure(Connect, "cannot hash the server's host key"))?
-  var verdict = Accept
+  var verdict = Verdict.Accept
   match config.host_key {
     Strict(_) => verdict = judge_known(false, ssh_session_is_known_server(session), config.host, actual)
     AcceptNew(_) => verdict = judge_known(true, ssh_session_is_known_server(session), config.host, actual)
@@ -912,9 +912,9 @@ fn verdict(found: Verdict) -> String {
 #[test("a secret never shows in text")]
 fn secrets_are_hidden() -> Unit {
   let methods = [
-    Password(Secret.new("hunter2")),
-    KeyFile(Path.from("key"), Some(Secret.new("open sesame"))),
-    Agent,
+    Auth.Password(Secret.new("hunter2")),
+    Auth.KeyFile(Path.from("key"), Some(Secret.new("open sesame"))),
+    Auth.Agent,
   ]
   expect.equal("{methods}", "[Password(<secret>), KeyFile(key, Some(<secret>)), Agent]")
   expect.equal(methods.map(describe), ["the password", "the key key", "the agent"])

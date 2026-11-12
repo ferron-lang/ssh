@@ -65,19 +65,19 @@ pub(pkg) fn failure(kind: SshErrorKind, message: String) -> SshError {
 #[test("every kind displays as its name")]
 fn kinds_display_as_names() -> Unit {
   let kinds = [
-    HostKey,
-    Listen,
+    SshErrorKind.HostKey,
+    SshErrorKind.Listen,
     SshErrorKind.Closed,
-    Config,
-    Connect,
-    Timeout,
-    HostKeyUnknown,
-    HostKeyChanged,
-    KnownHosts,
-    Authentication,
-    Channel,
-    TooLarge,
-    Actor,
+    SshErrorKind.Config,
+    SshErrorKind.Connect,
+    SshErrorKind.Timeout,
+    SshErrorKind.HostKeyUnknown,
+    SshErrorKind.HostKeyChanged,
+    SshErrorKind.KnownHosts,
+    SshErrorKind.Authentication,
+    SshErrorKind.Channel,
+    SshErrorKind.TooLarge,
+    SshErrorKind.Actor,
   ]
   expect.equal(
     "{kinds}",
